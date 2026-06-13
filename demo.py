@@ -291,7 +291,8 @@ async def redeem_code_demo() -> None:
 
 
 if __name__ == "__main__":
-    queue_type =  QUEUE_TYPE_COIN # QUEUE_TYPE_NORMAL / QUEUE_TYPE_COIN
+    queue_type =  QUEUE_TYPE_NORMAL # QUEUE_TYPE_NORMAL / QUEUE_TYPE_COIN
+    input("demo使用完全硬编码流程，可能出现意想不到的问题，请知晓风险，回车继续执行...")
     ## ------------------------------
     # 查询剩余时长和预计排队时长
     # asyncio.run(account_info())
@@ -306,8 +307,8 @@ if __name__ == "__main__":
 
     ## ------------------------------
     # 输入演示：等待进入画面、点击中心、打开背包和菜单并截图
-    asyncio.run(input_demo())
+    # asyncio.run(input_demo())
 
     ## ------------------------------
     # 兑换码使用演示：进入游戏、打开菜单、输入兑换码并逐步截图
-    # asyncio.run(redeem_code_demo())
+    asyncio.run(redeem_code_demo())
