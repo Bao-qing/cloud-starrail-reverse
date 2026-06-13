@@ -1,0 +1,37 @@
+{
+  "device_profile": {
+    "device_id": "a1b2c3d4-0000-4000-8000-000000000000",
+    "os": "Linux 6.12.65-amd64-desktop-rolling",
+    "model": "XPS 15 9520",
+    "cpu_cores": 16,
+    "cpu_freq": 3200,
+    "cpu_type": "Intel Core i7-12700H",
+    "memory_gb": 32,
+    "soc": "Intel Alder Lake-P",
+    "gpu_model": "Intel Iris Xe Graphics",
+    "screen_width": 1920,
+    "screen_height": 1080,
+    "dpi": 96,
+    "device_name": "XPS-15-9520",
+    "sys_version": "Linux 6.12.65"
+  },
+  "browser_profile": {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "sec_ch_ua": "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\"",
+    "app_version": "4.3.1",
+    "web_device_name": "Chrome",
+    "web_device_model": "Chrome%20146.0.0.0",
+    "web_device_os": "Linux%2064-bit"
+  },
+  "protocol_profile": {
+    "client_lib": "python-aiortc",
+    "sdk_webview_ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+  },
+  "session_profile": {
+    "graphics_mode": 0,
+    "bitrate_multiplier": 1.875,
+    "resolution": "1920x1080",
+    "fps": 30,
+    "bit_rate": 5000000
+  }
+}
