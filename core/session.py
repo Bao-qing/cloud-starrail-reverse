@@ -1160,7 +1160,13 @@ class GameSession:
         cmd_id = packet["cmd_id"]
         message = packet["message"]
         logger.debug("proxy packet %s message bytes %d", cmd_id, len(message))
-        if cmd_id in (20002, 20005):
+        if cmd_id == 20002:
+            fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
+            retcode = fields.get(1, 0)
+            if retcode != 1:
+                raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
+            logger.debug("StartGameRsp OK")
+        elif cmd_id == 20005:
             logger.debug("proxy fields %s", Protocol.proto_fields(message))
         if cmd_id == CMD_RTC_NOT_PLAYING_TIPS:
             await self._send_keep_playing("not_playing_tips")
@@ -1242,6 +1248,30 @@ class GameSession:
             logger.debug("websocket open")
             await self._ws_send(Protocol.start_game_frame(self.params, link_tasks_ms=START_GAME_LINK_TASKS_MS))
             logger.debug("sent StartGameReq")
+
+            # 等待 StartGameRsp 成功后再发送 client hello，避免服务端状态错乱
+            start_game_ok = False
+            while not start_game_ok and not self.stopped:
+                message = await self._ws_recv()
+                if isinstance(message, str):
+                    logger.debug("text frame %s", message[:200])
+                    continue
+
+                frame = Protocol.parse_ws_frame(message)
+                if frame["frame_type"] == FRAME_PROXY:
+                    packet = Protocol.parse_packet(frame["payload"])
+                    if packet["cmd_id"] == 20002:
+                        fields = {fn: v for fn, _wt, v in Protocol.proto_fields(packet["message"])}
+                        retcode = fields.get(1, 0)
+                        if retcode != 1:
+                            raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
+                        logger.debug("StartGameRsp OK")
+                        start_game_ok = True
+                    else:
+                        logger.debug("unexpected proxy cmd_id=%s before StartGameRsp", packet["cmd_id"])
+                else:
+                    logger.debug("unexpected frame type=%s before StartGameRsp", frame["frame_type"])
+
             await self._ws_send(Protocol.ws_frame(FRAME_HANDSHAKE, CLIENT_HELLO_JSON))
             logger.debug("sent client hello")
             self.keep_playing_task = asyncio.create_task(self._keep_playing_loop())

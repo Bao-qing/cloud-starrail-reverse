@@ -12,8 +12,8 @@ def get_logger(name: str | None = None) -> logging.Logger:
     return logging.getLogger(LOGGER_NAME if name is None else f"{LOGGER_NAME}.{name}")
 
 
-def configure_logging(level: int | str = logging.INFO) -> None:
-    """配置默认控制台日志输出。"""
+def configure_logging(level: int | str = logging.INFO, log_file: str | None = None) -> None:
+    """配置默认控制台日志输出。若指定 *log_file*，同时写入文件。"""
     if isinstance(level, str):
         level = getattr(logging, level.upper(), logging.INFO)
 
@@ -21,10 +21,17 @@ def configure_logging(level: int | str = logging.INFO) -> None:
     root_logger.setLevel(level)
     root_logger.propagate = False
 
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", "%H:%M:%S")
+
     if not root_logger.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", "%H:%M:%S"))
-        root_logger.addHandler(handler)
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
 
     # 抑制外部库的连接/媒体协商噪声；项目自己的 cloud_game logger 不受影响。
     for noisy in (
