@@ -70,7 +70,12 @@ CLIENT_HELLO_JSON = '{"client_type":"web","type":"client hello"}'
 
 
 async def connect_websocket(url: str, *, timeout: float = 10, headers: Mapping[str, str] | None = None):
-    """建立异步 WebSocket 连接。"""
+    """建立异步 WebSocket 连接。
+
+    注意：这里关闭了证书校验（``CERT_NONE``）。云游戏信令与游戏控制通道会把
+    候选地址重写成裸 IP，标准主机名校验必然失败，故沿用服务端的既定行为。
+    若后续切换到可校验证书的入口，应改回默认校验或固定 CA。
+    """
     request_headers = dict(headers or {})
     origin = request_headers.pop("Origin", None)
     user_agent = request_headers.pop("User-Agent", None)
@@ -87,6 +92,7 @@ async def connect_websocket(url: str, *, timeout: float = 10, headers: Mapping[s
         ping_interval=None,
         max_size=None,
     )
+
 
 class LogText:
     @staticmethod
@@ -188,10 +194,13 @@ class SdkGameDataHandler:
         open_id = combo.get("oi") or self._cookie_value("account_id_v2") or self._cookie_value("account_id")
         app_id = int(combo.get("ai") or SDK_FALLBACK_APP_ID)
         channel_id = int(combo.get("ci") or SDK_FALLBACK_CHANNEL_ID)
+        # account_type 与 channel_id 取同一来源（combo "ci"）：网页 SDK 对当前渠道
+        # 二者一致，留此注释以免被误判为复制粘贴遗漏。
         account_type = int(combo.get("ci") or SDK_FALLBACK_CHANNEL_ID)
+        valid = bool(self.channel_token and open_id and combo.get("ct"))
         return {
-            "ret": 0 if self.channel_token and open_id and combo.get("ct") else -1,
-            "msg": "成功" if self.channel_token and open_id and combo.get("ct") else "missing web account token",
+            "ret": 0 if valid else -1,
+            "msg": "成功" if valid else "missing web account token",
             "data": {
                 "device_id": device_id,
                 "app_id": app_id,
@@ -274,92 +283,106 @@ class SdkGameDataHandler:
             key = str(raw_params)
             return [self._response(index, self.cloud_data.get(key, ""))]
         if function_name == "cloud_set_data":
-            try:
-                params = json.loads(raw_params)
-                if "key" in params or "name" in params:
-                    key = str(params.get("key") or params.get("name") or "")
-                    value = params.get("data", "")
-                    if key:
-                        self.cloud_data[key] = value if isinstance(value, str) else json.dumps(value,
-                                                                                               ensure_ascii=False)
-                else:
-                    for key, value in params.items():
-                        self.cloud_data[str(key)] = value if isinstance(value, str) else json.dumps(value,
-                                                                                                    ensure_ascii=False)
-            except Exception:
-                pass
+            self._store_cloud_data(raw_params)
             if index < 0:
                 return []
             return [self._response(index, "")]
         if function_name == "invoke_return":
-            try:
-                nested = json.loads(raw_params)
-            except json.JSONDecodeError:
-                return [self._error_response(index, function_name, "invoke")]
-            nested_name = nested.get("f", "")
-            nested_params = nested.get("p", "")
-            if nested_name == "info_get_cps":
-                return [self._invoke_response(index, SDK_CPS)]
-            if nested_name == "info_get_uapc":
-                return [self._invoke_response(index, "")]
-            if nested_name in ("info_get_channel_id", "info_get_sub_channel_id"):
-                return [self._invoke_response(index, SDK_CHANNEL_ID_RESPONSE)]
-            if nested_name == "get_disk_type":
-                return [self._error_response(index, "diskType", "get")]
-            if nested_name == "cloud_keep_alive":
-                return [self._invoke_response(index, "")]
-            if nested_name in (
-                    "launch_show_user_agreement_with_parameters",
-                    "launch_show_user_agreement_with_parameters_compliance",
-            ):
-                return [self._invoke_response(index, {"ret": 0, "msg": "OK"})]
-            logger.debug("unhandled SDK invoke_return f=%s p=%s", nested_name, nested_params)
-            return [self._error_response(index, nested_name, "invoke")]
+            return self._handle_invoke_return(index, raw_params)
         if function_name in ("invoke", "invokeF", "invokeP"):
-            try:
-                nested = json.loads(raw_params)
-            except json.JSONDecodeError:
-                nested = {}
-            nested_name = nested.get("f") or nested.get("invokeF") or nested.get("invokeP") or function_name
-            if nested_name == "login_login":
-                return [self._invoke_response(index, self._login_response())]
-            if nested_name in (
-                    "launch_show_user_agreement_with_parameters",
-                    "launch_show_user_agreement_with_parameters_compliance",
-            ):
-                return [self._invoke_response(index, self._agreement_response())]
-            if nested_name == "Init":
-                return self._init_callbacks()
-            if index < 0 and str(nested_name).startswith("report_"):
-                return []
-            if index < 0 and nested_name in (
-                    "all_set_env",
-                    "all_set_language",
-                    "all_set_volume",
-                    "info_set_game_parameters",
-                    "info_set_game_version",
-                    "login_set_server_id",
-                    "report_set_info",
-                    "watermark_set_enable",
-                    "web_set_joypad_enable",
-                    "web_set_linear",
-            ):
-                return []
-            logger.debug("unhandled SDK %s nested=%s p=%s", function_name, nested_name, raw_params)
-            return [self._error_response(index, str(nested_name), "invoke")]
+            return self._handle_invoke(index, function_name, raw_params)
         if function_name == "webview":
-            try:
-                nested = json.loads(raw_params)
-            except json.JSONDecodeError:
-                nested = {}
-            if nested.get("f") == "get_global_user_agent":
-                return [self._invoke_response(index, self.core_config.protocol_profile.sdk_webview_ua)]
-            if index < 0 and nested.get("f") in ("set_global_user_agent", "pre_load"):
-                return []
-            logger.debug("unhandled SDK webview nested=%s p=%s", nested.get("f"), raw_params)
-            return [self._error_response(index, str(nested.get("f") or "webview"), "webview")]
+            return self._handle_webview(index, raw_params)
         logger.debug("unhandled SDK message f=%s p=%s", function_name, raw_params)
         return []
+
+    def _store_cloud_data(self, raw_params) -> None:
+        """解析并写入 cloud_set_data 的键值。"""
+        try:
+            params = json.loads(raw_params)
+        except Exception:
+            return
+        if "key" in params or "name" in params:
+            key = str(params.get("key") or params.get("name") or "")
+            value = params.get("data", "")
+            if key:
+                self.cloud_data[key] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            return
+        for key, value in params.items():
+            self.cloud_data[str(key)] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+    def _handle_invoke_return(self, index: int, raw_params) -> list[dict]:
+        """处理 invoke_return 调用。"""
+        try:
+            nested = json.loads(raw_params)
+        except json.JSONDecodeError:
+            return [self._error_response(index, "invoke_return", "invoke")]
+        nested_name = nested.get("f", "")
+        nested_params = nested.get("p", "")
+        if nested_name == "info_get_cps":
+            return [self._invoke_response(index, SDK_CPS)]
+        if nested_name == "info_get_uapc":
+            return [self._invoke_response(index, "")]
+        if nested_name in ("info_get_channel_id", "info_get_sub_channel_id"):
+            return [self._invoke_response(index, SDK_CHANNEL_ID_RESPONSE)]
+        if nested_name == "get_disk_type":
+            return [self._error_response(index, "diskType", "get")]
+        if nested_name == "cloud_keep_alive":
+            return [self._invoke_response(index, "")]
+        if nested_name in (
+                "launch_show_user_agreement_with_parameters",
+                "launch_show_user_agreement_with_parameters_compliance",
+        ):
+            return [self._invoke_response(index, {"ret": 0, "msg": "OK"})]
+        logger.debug("unhandled SDK invoke_return f=%s p=%s", nested_name, nested_params)
+        return [self._error_response(index, nested_name, "invoke")]
+
+    def _handle_invoke(self, index: int, function_name: str, raw_params) -> list[dict]:
+        """处理 invoke / invokeF / invokeP 调用。"""
+        try:
+            nested = json.loads(raw_params)
+        except json.JSONDecodeError:
+            nested = {}
+        nested_name = nested.get("f") or nested.get("invokeF") or nested.get("invokeP") or function_name
+        if nested_name == "login_login":
+            return [self._invoke_response(index, self._login_response())]
+        if nested_name in (
+                "launch_show_user_agreement_with_parameters",
+                "launch_show_user_agreement_with_parameters_compliance",
+        ):
+            return [self._invoke_response(index, self._agreement_response())]
+        if nested_name == "Init":
+            return self._init_callbacks()
+        if index < 0 and str(nested_name).startswith("report_"):
+            return []
+        if index < 0 and nested_name in (
+                "all_set_env",
+                "all_set_language",
+                "all_set_volume",
+                "info_set_game_parameters",
+                "info_set_game_version",
+                "login_set_server_id",
+                "report_set_info",
+                "watermark_set_enable",
+                "web_set_joypad_enable",
+                "web_set_linear",
+        ):
+            return []
+        logger.debug("unhandled SDK %s nested=%s p=%s", function_name, nested_name, raw_params)
+        return [self._error_response(index, str(nested_name), "invoke")]
+
+    def _handle_webview(self, index: int, raw_params) -> list[dict]:
+        """处理 webview 调用。"""
+        try:
+            nested = json.loads(raw_params)
+        except json.JSONDecodeError:
+            nested = {}
+        if nested.get("f") == "get_global_user_agent":
+            return [self._invoke_response(index, self.core_config.protocol_profile.sdk_webview_ua)]
+        if index < 0 and nested.get("f") in ("set_global_user_agent", "pre_load"):
+            return []
+        logger.debug("unhandled SDK webview nested=%s p=%s", nested.get("f"), raw_params)
+        return [self._error_response(index, str(nested.get("f") or "webview"), "webview")]
 
 
 class WsPayloadFormatter:
@@ -453,41 +476,63 @@ class TrackConsumer:
                 frame = await track.recv()
                 count += 1
                 if count == 1:
-                    if track.kind == "video":
-                        logger.debug("video first frame received size=%sx%s",
-                                    getattr(frame, "width", "?"), getattr(frame, "height", "?"))
-                        if self.video_connected_event is not None:
-                            self.video_connected_event.set()
-                        if self.video_connected_callback is not None:
-                            self.video_connected_callback()
-                    else:
-                        logger.debug("%s first frame received", track.kind)
+                    self._on_first_frame(track, frame)
                 if count % 120 == 0:
-                    pts = getattr(frame, "pts", None)
-                    width = getattr(frame, "width", None)
-                    height = getattr(frame, "height", None)
-                    logger.debug("%s frame count=%s pts=%s size=%sx%s", track.kind, count, pts, width, height)
+                    self._log_progress(track, frame, count)
                 if track.kind == "video":
-                    requested = self.video_frame_request_event is not None and self.video_frame_request_event.is_set()
-                    auto_trigger = self.video_frame_interval is not None and time.monotonic() >= next_video_callback_at
-                    need_callback = self.video_frame_callback is not None and (requested or auto_trigger)
-                    need_snapshot = self.snapshot_dir is not None and time.monotonic() >= next_snapshot_at
-                    if need_callback or need_snapshot:
-                        image = frame.reformat(format="rgb24").to_image()
-                        if need_callback:
-                            self.video_frame_callback(image, count)
-                            if requested and self.video_frame_request_event is not None:
-                                self.video_frame_request_event.clear()
-                            if auto_trigger and self.video_frame_interval is not None:
-                                next_video_callback_at = time.monotonic() + self.video_frame_interval
-                        if need_snapshot:
-                            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-                            path = self.snapshot_dir / f"video_{int(time.time())}_{count:06d}.jpg"
-                            await asyncio.to_thread(image.save, path, "JPEG", quality=90)
-                            logger.info("saved snapshot %s", path)
-                            next_snapshot_at = time.monotonic() + self.snapshot_interval
+                    next_snapshot_at, next_video_callback_at = await self._handle_video_frame(
+                        frame, count, next_snapshot_at, next_video_callback_at
+                    )
         except MediaStreamError:
             logger.debug("%s track ended after %s frames", track.kind, count)
+
+    def _on_first_frame(self, track, frame) -> None:
+        """记录并通知首帧到达。"""
+        if track.kind == "video":
+            logger.debug(
+                "video first frame received size=%sx%s",
+                getattr(frame, "width", "?"), getattr(frame, "height", "?"),
+            )
+            if self.video_connected_event is not None:
+                self.video_connected_event.set()
+            if self.video_connected_callback is not None:
+                self.video_connected_callback()
+        else:
+            logger.debug("%s first frame received", track.kind)
+
+    @staticmethod
+    def _log_progress(track, frame, count: int) -> None:
+        """周期性记录轨道进度。"""
+        pts = getattr(frame, "pts", None)
+        width = getattr(frame, "width", None)
+        height = getattr(frame, "height", None)
+        logger.debug("%s frame count=%s pts=%s size=%sx%s", track.kind, count, pts, width, height)
+
+    async def _handle_video_frame(
+            self, frame, count: int, next_snapshot_at: float, next_video_callback_at: float
+    ) -> tuple[float, float]:
+        """处理一帧视频：按需回调与保存快照，返回更新后的下次触发时间。"""
+        requested = self.video_frame_request_event is not None and self.video_frame_request_event.is_set()
+        auto_trigger = self.video_frame_interval is not None and time.monotonic() >= next_video_callback_at
+        need_callback = self.video_frame_callback is not None and (requested or auto_trigger)
+        need_snapshot = self.snapshot_dir is not None and time.monotonic() >= next_snapshot_at
+        if not (need_callback or need_snapshot):
+            return next_snapshot_at, next_video_callback_at
+
+        image = frame.reformat(format="rgb24").to_image()
+        if need_callback:
+            self.video_frame_callback(image, count)
+            if requested and self.video_frame_request_event is not None:
+                self.video_frame_request_event.clear()
+            if auto_trigger and self.video_frame_interval is not None:
+                next_video_callback_at = time.monotonic() + self.video_frame_interval
+        if need_snapshot:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            path = self.snapshot_dir / f"video_{int(time.time())}_{count:06d}.jpg"
+            await asyncio.to_thread(image.save, path, "JPEG", quality=90)
+            logger.info("saved snapshot %s", path)
+            next_snapshot_at = time.monotonic() + self.snapshot_interval
+        return next_snapshot_at, next_video_callback_at
 
 
 class ControlActionScript:
@@ -611,13 +656,11 @@ class GameControlChannel:
             full_url = self._url_with_session_id(url)
             try:
                 self.status(f"game control channel connecting {urlsplit(full_url).netloc}", level=logging.DEBUG)
-                headers = {"Origin": GAME_CONTROL_ORIGIN}
-                headers["User-Agent"] = self.core_config.browser_profile.user_agent
-                self.websocket = await connect_websocket(
-                    full_url,
-                    timeout=5,
-                    headers=headers,
-                )
+                headers = {
+                    "Origin": GAME_CONTROL_ORIGIN,
+                    "User-Agent": self.core_config.browser_profile.user_agent,
+                }
+                self.websocket = await connect_websocket(full_url, timeout=5, headers=headers)
                 self.recv_task = asyncio.create_task(self.recv_loop())
                 await self.send_control_packet(CMD_KCP_CONNECT_SYNC)
                 return True
@@ -653,25 +696,29 @@ class GameControlChannel:
                 kind = message[0]
                 payload = message[1:]
                 if kind == 0:
-                    packet = Protocol.parse_packet(payload)
-                    cmd_id = packet["cmd_id"]
-                    if cmd_id == CMD_KCP_CONNECT_SYNC_ACK:
-                        await self.send_control_packet(CMD_KCP_CONNECT_ACK)
-                        self.alive = True
-                        self.last_pong_at = time.monotonic()
-                        self.status("game control channel ready", level=logging.DEBUG)
-                        if self.ping_task is None or self.ping_task.done():
-                            self.ping_task = asyncio.create_task(self.ping_loop())
-                    elif cmd_id == CMD_KCP_PONG:
-                        self.last_pong_at = time.monotonic()
-                    else:
-                        self.status(f"game control channel unknown control cmd={cmd_id}", level=logging.DEBUG)
+                    await self._handle_control_packet(payload)
                 elif kind == 1:
                     pass
         except Exception as exc:
             self.status(f"game control channel recv stopped: {type(exc).__name__}: {exc}", level=logging.DEBUG)
         finally:
             self.alive = False
+
+    async def _handle_control_packet(self, payload: bytes) -> None:
+        """处理一条控制（kind=0）数据包。"""
+        packet = Protocol.parse_packet(payload)
+        cmd_id = packet["cmd_id"]
+        if cmd_id == CMD_KCP_CONNECT_SYNC_ACK:
+            await self.send_control_packet(CMD_KCP_CONNECT_ACK)
+            self.alive = True
+            self.last_pong_at = time.monotonic()
+            self.status("game control channel ready", level=logging.DEBUG)
+            if self.ping_task is None or self.ping_task.done():
+                self.ping_task = asyncio.create_task(self.ping_loop())
+        elif cmd_id == CMD_KCP_PONG:
+            self.last_pong_at = time.monotonic()
+        else:
+            self.status(f"game control channel unknown control cmd={cmd_id}", level=logging.DEBUG)
 
     async def ping_loop(self) -> None:
         """定时发送控制通道 ping 并检测超时。"""
@@ -768,7 +815,6 @@ class GameSession:
             clipboard_getter=config.clipboard_getter,
             core_config=config.core_config,
         )
-        self.sdk_game_data_codec = Protocol
 
         # ---- 运行时状态 ----
         self.pc = RTCPeerConnection()
@@ -776,12 +822,15 @@ class GameSession:
         self.gcc: GameControlChannel | None = None  # 游戏控制通道（输入首选）
         self.rtc_channel = None  # RTC DataChannel（输入回退）
         self.video_connected = asyncio.Event()
-        self.first_video = self.video_connected
+        self.first_video = self.video_connected  # 向后兼容别名
         self._video_received = False
         self.heartbeat_task: asyncio.Task | None = None
         self.keep_playing_task: asyncio.Task | None = None
         self.stop_watcher_task: asyncio.Task | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
+
+        # 受管理的 fire-and-forget 任务集合：避免被 GC 提前回收，并统一记录异常。
+        self._tasks: set[asyncio.Task] = set()
 
         # 只发一次的握手步骤标志。
         self.device_info_sent = False
@@ -802,6 +851,25 @@ class GameSession:
         if self.config.finish_result is not None:
             return self.config.finish_result
         raise RuntimeError("missing finish_result; load it in UI or dispatch before connect")
+
+    # ------------------------------------------------------------------
+    # 后台任务管理
+    # ------------------------------------------------------------------
+    def _spawn(self, coro, *, name: str | None = None) -> asyncio.Task:
+        """启动一个受管理的后台任务，保存引用并记录异常。"""
+        task = asyncio.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """后台任务结束时清理引用并记录未捕获异常。"""
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("background task %s failed: %r", task.get_name(), exc)
 
     @property
     def game_control_urls(self) -> list[str]:
@@ -826,15 +894,6 @@ class GameSession:
     # ------------------------------------------------------------------
     # 通用辅助
     # ------------------------------------------------------------------
-
-    # def _url_with_session_id(self, url: str) -> str:
-    #     """给信令 URL 附加 session_id。"""
-    #     parts = urlsplit(url)
-    #     scheme = "wss" if parts.scheme in ("", "http", "https", "ws", "wss") else parts.scheme
-    #     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    #     query["sessionId"] = str(self.session_id)
-    #     return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
     def status(self, message: str, level: int = logging.INFO) -> None:
         """输出一条面向用户的状态文本：写日志并转发给 UI 回调。"""
         logger.log(level, message)
@@ -903,7 +962,7 @@ class GameSession:
         action_type = action.get("type")
         # 优先走游戏控制通道，其次回退到 RTC DataChannel。
         if self.has_game_control_channel:
-            asyncio.create_task(self.gcc.send_data(packet))
+            self._spawn(self.gcc.send_data(packet), name="gcc-send-input")
             self.status(f"input {action_type} via game control channel", level=logging.DEBUG)
             return
         if self.has_rtc_channel:
@@ -1007,24 +1066,30 @@ class GameSession:
     def _on_track(self, track) -> None:
         """处理远端媒体轨道并启动消费任务。"""
         self.status(f"track {track.kind}", level=logging.DEBUG)
+        is_video = track.kind == "video"
         consumer = TrackConsumer(
             self.snapshot_path,
             self.config.snapshot_interval,
             video_frame_callback=self.video_frame_callback,
             video_frame_interval=self.config.video_frame_interval,
             video_frame_request_event=self.config.video_frame_request_event,
-            video_connected_event=self.video_connected if track.kind == "video" else None,
-            video_connected_callback=(lambda: setattr(self, '_video_received', True)) if track.kind == "video" else None,
+            video_connected_event=self.video_connected if is_video else None,
+            video_connected_callback=self._mark_video_received if is_video else None,
         )
-        asyncio.create_task(consumer.consume(track))
+        self._spawn(consumer.consume(track), name=f"consume-{track.kind}")
+
+    def _mark_video_received(self) -> None:
+        """标记已收到视频首帧。"""
+        self._video_received = True
 
     def _on_datachannel(self, channel) -> None:
         """处理远端 DataChannel 并注册通道回调。"""
         logger.debug("datachannel %s ordered=%s", channel.label, channel.ordered)
         self.rtc_channel = channel
         if self.actions:
-            asyncio.create_task(
-                ControlActionScript.run_when_channel_opens(channel, self.actions, self.normalize_size)
+            self._spawn(
+                ControlActionScript.run_when_channel_opens(channel, self.actions, self.normalize_size),
+                name="control-actions",
             )
 
         @channel.on("open")
@@ -1033,7 +1098,7 @@ class GameSession:
             logger.debug("datachannel open %s", channel.label)
             if self.heartbeat_task is None or self.heartbeat_task.done():
                 self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(channel))
-            asyncio.create_task(self._send_startup_config_once("datachannel open"))
+            self._spawn(self._send_startup_config_once("datachannel open"), name="startup-config")
 
         @channel.on("close")
         def on_close():
@@ -1094,6 +1159,15 @@ class GameSession:
     # ------------------------------------------------------------------
     # RMQ / SDK game-data 应答
     # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_start_game_rsp(message: bytes) -> None:
+        """校验 StartGameRsp（cmd 20002），retcode != 1 时抛出。"""
+        fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
+        retcode = fields.get(1, 0)
+        if retcode != 1:
+            raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
+        logger.debug("StartGameRsp OK")
+
     async def _handle_sdk_game_data(self, rmq_payload: bytes, source_msg_id: int) -> None:
         """解出 SdkGameDataMessage，解密内层 JSON，交给应答器并回包。"""
         try:
@@ -1121,8 +1195,18 @@ class GameSession:
             )
             self.rmq_game_outgoing_id += 1
 
+    def _reset_rmq_buffer(self) -> None:
+        """复位 RMQ 分片重组缓冲。"""
+        self._rmq_rx_data = b""
+        self._rmq_rx_msg_id = 0
+        self._rmq_rx_total_len = 0
+
     async def _handle_rmq_message(self, rmq: dict) -> None:
-        """处理一条 RMQ 消息：忽略 ack，按 total_len 重组分片后再 ACK。"""
+        """处理一条 RMQ 消息：忽略 ack，按 total_len 重组分片后再 ACK。
+
+        重组假设同一时刻只有一条消息在分片且按序到达。若在旧消息未完成时
+        又收到新消息的起始分片（type 1/2），会丢弃残缺缓冲并告警，避免错位。
+        """
         if rmq["msg_type"] == 4:  # 对端发来的 ack，无需处理
             logger.debug("rmq ack received data=%s", rmq["data"].hex())
             return
@@ -1130,8 +1214,14 @@ class GameSession:
             logger.warning("rmq unsupported type %s", rmq["msg_type"])
             return
 
-        # 新消息的首个分片：记录消息号与总长度。
-        if rmq["msg_type"] in (1, 2) and not self._rmq_rx_data:
+        # type 1/2 视为消息起始分片；若缓冲非空说明上一条未完成，丢弃并告警。
+        if rmq["msg_type"] in (1, 2):
+            if self._rmq_rx_data:
+                logger.warning(
+                    "rmq new message started before previous completed; discarding %d buffered bytes",
+                    len(self._rmq_rx_data),
+                )
+            self._reset_rmq_buffer()
             self._rmq_rx_msg_id = rmq["msg_id"]
             self._rmq_rx_total_len = rmq["total_len"]
         self._rmq_rx_data += rmq["data"]
@@ -1148,9 +1238,7 @@ class GameSession:
         # 分片到齐，取出完整消息并复位缓冲。
         complete_msg_id = self._rmq_rx_msg_id or rmq["msg_id"]
         complete_data = self._rmq_rx_data[:total_len]
-        self._rmq_rx_data = b""
-        self._rmq_rx_msg_id = 0
-        self._rmq_rx_total_len = 0
+        self._reset_rmq_buffer()
 
         await self._handle_sdk_game_data(complete_data, complete_msg_id)
         await self._ws_send(
@@ -1169,26 +1257,9 @@ class GameSession:
         message = packet["message"]
         logger.debug("proxy packet %s message bytes %d", cmd_id, len(message))
         if cmd_id == 20002:
-            fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
-            retcode = fields.get(1, 0)
-            if retcode != 1:
-                raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
-            logger.debug("StartGameRsp OK")
+            self._parse_start_game_rsp(message)
         elif cmd_id == 20005:
-            fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
-            stop_info = fields.get(2, "")
-            title = ""
-            if isinstance(stop_info, str):
-                try:
-                    title = json.loads(stop_info).get("title", "")
-                except Exception:
-                    title = stop_info
-            logger.error("StopGameRsp received: %s", title or "game stopped")
-            try:
-                if self.ws is not None:
-                    await self.ws.close()
-            except Exception:
-                pass
+            await self._handle_stop_game(message)
             return
         if cmd_id == CMD_RTC_NOT_PLAYING_TIPS:
             await self._send_keep_playing("not_playing_tips")
@@ -1201,6 +1272,23 @@ class GameSession:
             )
             await self._handle_rmq_message(rmq)
 
+    async def _handle_stop_game(self, message: bytes) -> None:
+        """处理 StopGameRsp（cmd 20005）：记录原因并关闭信令连接。"""
+        fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
+        stop_info = fields.get(2, "")
+        title = ""
+        if isinstance(stop_info, str):
+            try:
+                title = json.loads(stop_info).get("title", "")
+            except Exception:
+                title = stop_info
+        logger.error("StopGameRsp received: %s", title or "game stopped")
+        try:
+            if self.ws is not None:
+                await self.ws.close()
+        except Exception:
+            pass
+
     async def _handle_handshake_frame(self, payload: bytes) -> None:
         """处理握手帧并启动控制通道。"""
         text = payload.decode("utf-8", errors="replace")
@@ -1210,7 +1298,7 @@ class GameSession:
         except (ValueError, json.JSONDecodeError):
             session_id = 0
         if session_id:
-            asyncio.create_task(self._start_game_control_channel(session_id))
+            self._spawn(self._start_game_control_channel(session_id), name="start-gcc")
 
     async def _handle_signaling_frame(self, payload: bytes) -> None:
         """处理 offer、answer 和 candidate 信令。"""
@@ -1226,7 +1314,7 @@ class GameSession:
                 "type": self.pc.localDescription.type,
             })
             logger.debug("sent answer bytes %d", len(self.pc.localDescription.sdp))
-            asyncio.create_task(self._request_key_frame_later())
+            self._spawn(self._request_key_frame_later(), name="key-frame-req")
         elif obj.get("type") == "candidates":
             obj = Protocol.rewrite_candidate(obj, self.params)
             candidate = candidate_from_sdp(obj["candidate"])
@@ -1252,10 +1340,53 @@ class GameSession:
         except Exception:
             pass
 
+    async def _await_start_game_rsp(self) -> None:
+        """发送 StartGameReq 并阻塞等待 StartGameRsp 成功。"""
+        await self._ws_send(Protocol.start_game_frame(self.params, link_tasks_ms=START_GAME_LINK_TASKS_MS))
+        logger.debug("sent StartGameReq")
+
+        # 等待 StartGameRsp 成功后再发送 client hello，避免服务端状态错乱。
+        while not self.stopped:
+            message = await self._ws_recv()
+            if isinstance(message, str):
+                logger.debug("text frame %s", message[:200])
+                continue
+            frame = Protocol.parse_ws_frame(message)
+            if frame["frame_type"] != FRAME_PROXY:
+                logger.debug("unexpected frame type=%s before StartGameRsp", frame["frame_type"])
+                continue
+            packet = Protocol.parse_packet(frame["payload"])
+            if packet["cmd_id"] == 20002:
+                self._parse_start_game_rsp(packet["message"])
+                return
+            logger.debug("unexpected proxy cmd_id=%s before StartGameRsp", packet["cmd_id"])
+
+    async def _main_loop(self) -> None:
+        """StartGameRsp 之后的主收发循环。"""
+        deadline = None if self.config.max_seconds <= 0 else self.loop.time() + self.config.max_seconds
+        while (deadline is None or self.loop.time() < deadline) and not self.stopped:
+            message = await self._ws_recv()
+            if isinstance(message, str):
+                logger.debug("text frame %s", message[:200])
+                continue
+            frame = Protocol.parse_ws_frame(message)
+            frame_type = frame["frame_type"]
+            if frame_type == FRAME_PROXY:
+                await self._handle_proxy_frame(frame["payload"])
+            elif frame_type == FRAME_HANDSHAKE:
+                await self._handle_handshake_frame(frame["payload"])
+            elif frame_type == FRAME_SIGNALING:
+                await self._handle_signaling_frame(frame["payload"])
+            else:
+                logger.debug("frame %s bytes %d", frame_type, len(frame["payload"]))
+        if deadline is not None and not self.stopped:
+            logger.debug("finished timeout window")
+
     async def run(self) -> None:
         """建立连接并跑完整个会话，直到超时或被 stop_event 中断。"""
         self.loop = asyncio.get_running_loop()
         self.video_connected.clear()
+        self._video_received = False
         self._register_pc_handlers()
         if self.input_ready_callback is not None:
             self.input_ready_callback(True)
@@ -1268,31 +1399,7 @@ class GameSession:
 
         try:
             logger.debug("websocket open")
-            await self._ws_send(Protocol.start_game_frame(self.params, link_tasks_ms=START_GAME_LINK_TASKS_MS))
-            logger.debug("sent StartGameReq")
-
-            # 等待 StartGameRsp 成功后再发送 client hello，避免服务端状态错乱
-            start_game_ok = False
-            while not start_game_ok and not self.stopped:
-                message = await self._ws_recv()
-                if isinstance(message, str):
-                    logger.debug("text frame %s", message[:200])
-                    continue
-
-                frame = Protocol.parse_ws_frame(message)
-                if frame["frame_type"] == FRAME_PROXY:
-                    packet = Protocol.parse_packet(frame["payload"])
-                    if packet["cmd_id"] == 20002:
-                        fields = {fn: v for fn, _wt, v in Protocol.proto_fields(packet["message"])}
-                        retcode = fields.get(1, 0)
-                        if retcode != 1:
-                            raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
-                        logger.debug("StartGameRsp OK")
-                        start_game_ok = True
-                    else:
-                        logger.debug("unexpected proxy cmd_id=%s before StartGameRsp", packet["cmd_id"])
-                else:
-                    logger.debug("unexpected frame type=%s before StartGameRsp", frame["frame_type"])
+            await self._await_start_game_rsp()
 
             await self._ws_send(Protocol.ws_frame(FRAME_HANDSHAKE, CLIENT_HELLO_JSON))
             logger.debug("sent client hello")
@@ -1301,33 +1408,19 @@ class GameSession:
             # ICE candidate 回调依赖 self.ws 已就绪，故在此处注册。
             self.pc.on("icecandidate")(self._on_icecandidate)
 
-            deadline = None if self.config.max_seconds <= 0 else self.loop.time() + self.config.max_seconds
-            while (deadline is None or self.loop.time() < deadline) and not self.stopped:
-                message = await self._ws_recv()
-                if isinstance(message, str):
-                    logger.debug("text frame %s", message[:200])
-                    continue
-
-                frame = Protocol.parse_ws_frame(message)
-                frame_type = frame["frame_type"]
-                if frame_type == FRAME_PROXY:
-                    await self._handle_proxy_frame(frame["payload"])
-                elif frame_type == FRAME_HANDSHAKE:
-                    await self._handle_handshake_frame(frame["payload"])
-                elif frame_type == FRAME_SIGNALING:
-                    await self._handle_signaling_frame(frame["payload"])
-                else:
-                    logger.debug("frame %s bytes %d", frame_type, len(frame["payload"]))
-
-            if deadline is not None and not self.stopped:
-                logger.debug("finished timeout window")
+            await self._main_loop()
         except ConnectionClosed:
             logger.debug("websocket connection closed")
         finally:
             await self._cleanup()
 
     async def _cleanup(self) -> None:
-        """释放所有资源：解绑输入回调、取消后台任务、关闭通道与连接。"""
+        """释放所有资源：解绑输入回调、取消后台任务、关闭通道与连接。
+
+        唤醒 ``wait_for_video_connected`` 的等待者：只 set 不 clear，
+        语义（成功 / 失败）由 ``_video_received`` 表达，避免唤醒后又被
+        clear 造成竞态或永久阻塞。
+        """
         self.video_connected.set()
         if self.input_ready_callback is not None:
             self.input_ready_callback(False)
@@ -1337,6 +1430,8 @@ class GameSession:
             self.keep_playing_task.cancel()
         if self.heartbeat_task is not None:
             self.heartbeat_task.cancel()
+        for task in list(self._tasks):
+            task.cancel()
         if self.gcc is not None:
             await self.gcc.close()
         try:
@@ -1348,7 +1443,6 @@ class GameSession:
                 await self.ws.close()
         except Exception:
             pass
-        self.video_connected.clear()
 
 
 __all__ = ["SessionConfig", "GameSession", "GameControlChannel", "ControlActionScript"]
