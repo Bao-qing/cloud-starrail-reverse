@@ -16,6 +16,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from .config import CoreConfig, normalize_core_config
 from .log import emit_log_callback, get_logger
@@ -431,6 +432,7 @@ class TrackConsumer:
             video_frame_interval: float | None = 0.1,
             video_frame_request_event: threading.Event | None = None,
             video_connected_event: asyncio.Event | None = None,
+            video_connected_callback: Callable[[], None] | None = None,
     ) -> None:
         """初始化实例并保存运行所需的状态。"""
         self.snapshot_dir = snapshot_dir
@@ -439,6 +441,7 @@ class TrackConsumer:
         self.video_frame_interval = video_frame_interval
         self.video_frame_request_event = video_frame_request_event
         self.video_connected_event = video_connected_event
+        self.video_connected_callback = video_connected_callback
 
     async def consume(self, track) -> None:
         """消费媒体轨道并按需回调视频帧或保存快照。"""
@@ -455,6 +458,8 @@ class TrackConsumer:
                                     getattr(frame, "width", "?"), getattr(frame, "height", "?"))
                         if self.video_connected_event is not None:
                             self.video_connected_event.set()
+                        if self.video_connected_callback is not None:
+                            self.video_connected_callback()
                     else:
                         logger.debug("%s first frame received", track.kind)
                 if count % 120 == 0:
@@ -772,6 +777,7 @@ class GameSession:
         self.rtc_channel = None  # RTC DataChannel（输入回退）
         self.video_connected = asyncio.Event()
         self.first_video = self.video_connected
+        self._video_received = False
         self.heartbeat_task: asyncio.Task | None = None
         self.keep_playing_task: asyncio.Task | None = None
         self.stop_watcher_task: asyncio.Task | None = None
@@ -909,13 +915,14 @@ class GameSession:
             self._last_input_skip_log_at = now
             self.status(f"input {action_type} skipped: no open game control/rtc datachannel", level=logging.DEBUG)
 
-    async def wait_for_video_connected(self) -> None:
+    async def wait_for_video_connected(self) -> bool:
         """等待视频流首帧到达。
 
-        这个方法只在首帧真正被 ``track.recv()`` 取到后返回；收到 video
-        track 但尚未出图时仍会继续等待。
+        返回 ``True`` 表示成功收到首帧；返回 ``False`` 表示会话已结束
+        （如连接断开）且未收到首帧。
         """
         await self.video_connected.wait()
+        return self._video_received
 
     # ------------------------------------------------------------------
     # 一次性握手步骤
@@ -1007,6 +1014,7 @@ class GameSession:
             video_frame_interval=self.config.video_frame_interval,
             video_frame_request_event=self.config.video_frame_request_event,
             video_connected_event=self.video_connected if track.kind == "video" else None,
+            video_connected_callback=(lambda: setattr(self, '_video_received', True)) if track.kind == "video" else None,
         )
         asyncio.create_task(consumer.consume(track))
 
@@ -1167,7 +1175,21 @@ class GameSession:
                 raise RuntimeError(f"StartGameRsp failed: retcode={retcode}")
             logger.debug("StartGameRsp OK")
         elif cmd_id == 20005:
-            logger.debug("proxy fields %s", Protocol.proto_fields(message))
+            fields = {fn: v for fn, _wt, v in Protocol.proto_fields(message)}
+            stop_info = fields.get(2, "")
+            title = ""
+            if isinstance(stop_info, str):
+                try:
+                    title = json.loads(stop_info).get("title", "")
+                except Exception:
+                    title = stop_info
+            logger.error("StopGameRsp received: %s", title or "game stopped")
+            try:
+                if self.ws is not None:
+                    await self.ws.close()
+            except Exception:
+                pass
+            return
         if cmd_id == CMD_RTC_NOT_PLAYING_TIPS:
             await self._send_keep_playing("not_playing_tips")
         if cmd_id == CMD_RELIABLE_MESSAGE_QUEUE_DATA:
@@ -1299,12 +1321,14 @@ class GameSession:
 
             if deadline is not None and not self.stopped:
                 logger.debug("finished timeout window")
+        except ConnectionClosed:
+            logger.debug("websocket connection closed")
         finally:
             await self._cleanup()
 
     async def _cleanup(self) -> None:
         """释放所有资源：解绑输入回调、取消后台任务、关闭通道与连接。"""
-        self.video_connected.clear()
+        self.video_connected.set()
         if self.input_ready_callback is not None:
             self.input_ready_callback(False)
         if self.stop_watcher_task is not None:
@@ -1315,7 +1339,10 @@ class GameSession:
             self.heartbeat_task.cancel()
         if self.gcc is not None:
             await self.gcc.close()
-        await self.pc.close()
+        try:
+            await self.pc.close()
+        except Exception:
+            pass
         try:
             if self.ws is not None:
                 await self.ws.close()

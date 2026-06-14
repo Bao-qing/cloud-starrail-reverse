@@ -33,7 +33,6 @@ def load_credentials(path: Path = Path("credentials.json")) -> Credentials:
 
 
 async def snapshot_interval() -> None:
-    configure_logging(logging.INFO)
     config = CloudGameConfig(
         max_seconds=0,
         queue_type=queue_type,
@@ -52,7 +51,6 @@ async def snapshot_interval() -> None:
     await cloud_game.run(dispatch=True, connect=True)
 
 async def snapshot_manual() -> None:
-    configure_logging(logging.INFO)
     config = CloudGameConfig(
         max_seconds=0,
         queue_type=queue_type,
@@ -89,7 +87,7 @@ async def snapshot_manual() -> None:
 
 
 async def account_info() -> None:
-    configure_logging(logging.INFO)
+    configure_logging(logging.INFO, log_file="demo.log")
     config = CloudGameConfig(
         queue_type=queue_type,
         # core_config=load_core_config(),
@@ -124,7 +122,6 @@ async def account_info() -> None:
 
 
 async def input_demo() -> None:
-    configure_logging(logging.INFO)
     config = CloudGameConfig(
         max_seconds=0,
         queue_type=queue_type,
@@ -169,7 +166,9 @@ async def input_demo() -> None:
             await asyncio.sleep(0.1)
 
         logger.info("等待视频首帧...")
-        await cloud_game.game_session.wait_for_video_connected()
+        connected = await cloud_game.game_session.wait_for_video_connected()
+        if not connected:
+            return False
 
         logger.info("等待 30s 后截取进入游戏前画面...")
         await asyncio.sleep(30)
@@ -201,7 +200,7 @@ async def input_demo() -> None:
 
 
 async def redeem_code_demo() -> None:
-    configure_logging(logging.INFO)
+    # configure_logging(logging.DEBUG, log_file="demo.log")
     config = CloudGameConfig(
         max_seconds=0,
         queue_type=queue_type,
@@ -254,7 +253,9 @@ async def redeem_code_demo() -> None:
             await asyncio.sleep(0.1)
 
         logger.info("等待视频首帧...")
-        await cloud_game.game_session.wait_for_video_connected()
+        connected = await cloud_game.game_session.wait_for_video_connected()
+        if not connected:
+            return False
 
         logger.info("等待 30s 后截取进入游戏前画面...")
         await asyncio.sleep(30)
@@ -291,8 +292,9 @@ async def redeem_code_demo() -> None:
 
 
 if __name__ == "__main__":
+    configure_logging(logging.INFO, log_file="demo.log")
     queue_type =  QUEUE_TYPE_NORMAL # QUEUE_TYPE_NORMAL / QUEUE_TYPE_COIN
-    input("demo使用完全硬编码流程，可能出现意想不到的问题，请知晓风险，回车继续执行...")
+    # input("demo使用完全硬编码流程，可能出现意想不到的问题，请知晓风险，回车继续执行...")
     ## ------------------------------
     # 查询剩余时长和预计排队时长
     # asyncio.run(account_info())
