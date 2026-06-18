@@ -1,9 +1,11 @@
+from .auth import Authenticator
 from .cloud_game import AccountState, CloudGame, CloudGameCallbacks, CloudGameState, QUEUE_TYPE_COIN, QUEUE_TYPE_NORMAL
 from .config import CoreConfig
 from .log import configure_logging, get_logger
 
 __all__ = [
     "AccountState",
+    "Authenticator",
     "CloudGame",
     "CloudGameCallbacks",
     "CloudGameState",

@@ -22,7 +22,7 @@ except ModuleNotFoundError as exc:
 
 from core import CloudGame, CloudGameCallbacks, QUEUE_TYPE_COIN, QUEUE_TYPE_NORMAL, configure_logging
 from core.config import loads_json_with_comments
-from core.models import CloudGameConfig, Credentials
+from core.models import CloudGameConfig
 
 
 class UiConfig:
@@ -33,15 +33,6 @@ class UiConfig:
     AUTO_CLICK_HOLD_MS = 80
 
 
-class UiCredentials:
-    try:
-        with open(Path(__file__).parent / "credentials.json", "r", encoding="utf-8") as _f:
-            _data = json.load(_f)
-            DEFAULT_COOKIE = _data.get("cookie", "")
-    except Exception:
-        DEFAULT_COOKIE = ""
-
-
 @dataclass
 class UiSettings:
     finish_result: str = "finish_result.json"
@@ -50,7 +41,6 @@ class UiSettings:
     queue_type: str = ""
     node: str = ""
     speed_client_type: int = 7
-    cookie: str = UiCredentials.DEFAULT_COOKIE
     ws_payload_limit: int = 2048
     control_json: str = ""
     click: str = ""
@@ -715,7 +705,7 @@ class CloudGameTkApp:
             self.events.put(("done", None))
 
     def _create_core(self) -> CloudGame:
-        """根据界面输入创建 CloudGame 实例。"""
+        """根据界面输入创建 CloudGame 实例, 并校验登录态。"""
         config = CloudGameConfig(
             max_seconds=int(self.seconds_var.get()),
             max_polls=self.settings.max_polls,
@@ -733,9 +723,8 @@ class CloudGameTkApp:
             core_config=self._load_core_config(),
             root_dir=self.root_dir,
         )
-        return CloudGame(
+        core = CloudGame(
             config=config,
-            credentials=Credentials(cookie=self.settings.cookie),
             callbacks=CloudGameCallbacks(
                 on_status=lambda message, level: self.events.put(("status", (message, level))),
                 on_dispatch_log=lambda line, level: self.events.put(("dispatch", (line, level))),
@@ -744,6 +733,18 @@ class CloudGameTkApp:
                 on_input_ready=self._set_input_ready,
             ),
         )
+        # 不在这里传 credentials —— 让 Authenticator 每次都从 credentials.json
+        # 读最新 cookie, 这样用户在另一终端跑 qrcode_login.py 重登后, 不重启 UI
+        # 下一次 Dispatch 也能直接拿到新凭据。
+        # GUI 没法在工作线程里阻塞等终端扫码 → auto_login=False, 失效时抛
+        # RuntimeError 由 _worker_main 转写到状态栏, 提示用户去命令行登录后再试。
+        try:
+            core.ensure_login(auto_login=False)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}; 请在命令行运行 `python qrcode_login.py login` 重新登录后再试"
+            ) from exc
+        return core
 
     @staticmethod
     def _format_wallet_summary(wallet: dict) -> str:

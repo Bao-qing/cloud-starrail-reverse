@@ -9,18 +9,20 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote_plus
 
 import requests
 
+from .auth import WEB_VERIFY_URL, parse_cookie_header
 from .config import CoreConfig
 from .log import emit_log_callback, get_logger
 
 # ---------------------------------------------------------------------------
 # 服务端点
 # ---------------------------------------------------------------------------
+# WEB_VERIFY_URL 由 ``core.auth`` 提供, 这里仅做共享 import 以保持单一来源;
+# Dispatcher 调用 webVerifyForGame 是为了换 channel_token, 与 Authenticator
+# 的"探活"语义不同, 因此不会引入 Authenticator 类。
 BASE_URL = "https://cg-hkrpg-api.mihoyo.com/hkrpg_cn/cg"
-WEB_VERIFY_URL = "https://passport-api.mihoyo.com/account/ma-cn-session/web/webVerifyForGame"
 WEB_LOGIN_URL = "https://hkrpg-sdk.mihoyo.com/hkrpg_cn/combo/granter/login/webLogin"
 WALLET_GET_PATH = "/wallet/wallet/get"
 
@@ -122,6 +124,9 @@ class Dispatcher:
         self.session = requests.Session()
         self._runtime_combo_token = ""
         self.last_account_sync: dict | None = None
+        # _cookie_value 用; 仅在 cookie 文本变化时重新解析
+        self._cookie_cache_source: str | None = None
+        self._cookie_cache: dict[str, str] = {}
 
     @property
     def cookie(self) -> str:
@@ -134,13 +139,12 @@ class Dispatcher:
         return self._runtime_combo_token or self.config.combo_token
 
     def _cookie_value(self, name: str, default: str = "") -> str:
-        """从 Cookie 字符串中读取指定键值。"""
-        prefix = name + "="
-        for part in self.cookie.split(";"):
-            item = part.strip()
-            if item.startswith(prefix):
-                return unquote_plus(item[len(prefix):])
-        return default
+        """从 Cookie 字符串中读取指定键值, 内部缓存解析结果。"""
+        cookie = self.cookie
+        if cookie != self._cookie_cache_source:
+            self._cookie_cache_source = cookie
+            self._cookie_cache = parse_cookie_header(cookie)
+        return self._cookie_cache.get(name, default)
 
     @property
     def _configured_device_id(self) -> str:

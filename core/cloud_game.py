@@ -7,6 +7,7 @@ import logging
 import threading
 from typing import Any
 
+from .auth import Authenticator
 from .config import normalize_core_config
 from .dispatcher import DispatchConfig, Dispatcher, QUEUE_TYPE_COIN, QUEUE_TYPE_NORMAL
 from .log import emit_log_callback
@@ -15,6 +16,7 @@ from .session import ControlActionScript, GameSession, SessionConfig
 
 __all__ = [
     "AccountState",
+    "Authenticator",
     "CloudGame",
     "CloudGameCallbacks",
     "CloudGameState",
@@ -90,6 +92,7 @@ class CloudGame:
         config: CloudGameConfig | None = None,
         credentials: Credentials | None = None,
         callbacks: CloudGameCallbacks | None = None,
+        authenticator: Authenticator | None = None,
     ) -> None:
         """创建云游戏客户端门面。
 
@@ -97,6 +100,10 @@ class CloudGame:
             config: 完整运行配置；None 表示使用 ``CloudGameConfig`` 默认值。
             credentials: 初始账号凭据；None 表示稍后通过方法参数传入。
             callbacks: 统一事件回调；方法参数中的旧回调仍会临时覆盖。
+            authenticator: 通行证认证客户端；None 时按 ``config.root_dir``
+                自动创建一个默认实例 (``credentials.json`` + ``log/`` 二维码目录)。
+                供 :meth:`login` / :meth:`ensure_login` 使用; 与 ``Dispatcher``
+                完全解耦, 调度链路不会触达本实例。
         """
         config = config or CloudGameConfig()
         core_config = normalize_core_config(config.core_config)
@@ -110,6 +117,10 @@ class CloudGame:
         self.callbacks = callbacks or CloudGameCallbacks()
         self.state = CloudGameState()
         self.dispatcher = Dispatcher(self.dispatch_config)
+        self.authenticator = authenticator or Authenticator(
+            credentials_path=self.config.root_dir / "credentials.json",
+            qr_dir=self.config.root_dir / "log",
+        )
         self.game_session: GameSession | None = None
         self._apply_credentials(credentials)
 
@@ -147,6 +158,65 @@ class CloudGame:
         if old_dispatcher is not None:
             old_dispatcher.close()
         self.dispatcher = Dispatcher(self.dispatch_config)
+
+    # ------------------------------------------------------------------
+    # 登录态管理 —— Authenticator 二次封装
+    # ------------------------------------------------------------------
+    def login(self, **qr_kwargs) -> Credentials:
+        """触发扫码登录, 写回 ``credentials.json`` 并应用到当前 CloudGame。
+
+        参数:
+            **qr_kwargs: 透传给 :meth:`Authenticator.login_qrcode`, 例如
+                ``poll_interval``、``timeout``、``terminal``、``on_status`` 等。
+
+        返回:
+            新的 :class:`Credentials`。combo_token / channel_token 字段为空,
+            后续 ``dispatch()`` 时由 ``Dispatcher.init()`` 填回。
+
+        副作用:
+            - 默认会写出 ``credentials.json`` (除非 ``write_credentials=False``)。
+            - 重建内部 ``Dispatcher`` 以使用新 cookie。
+        """
+        cookie = self.authenticator.login_qrcode(**qr_kwargs)
+        credentials = Credentials(cookie=cookie)
+        self._apply_credentials(credentials)
+        return credentials
+
+    def ensure_login(
+        self,
+        *,
+        auto_login: bool = True,
+        **qr_kwargs,
+    ) -> Credentials:
+        """初始化登录态, 必要时重新进入扫码登录。
+
+        参数:
+            auto_login: cookie 失效或缺失时是否自动触发扫码登录。
+                ``False`` 时直接抛出 ``RuntimeError``, 由调用方 (例如 GUI)
+                自行决定如何引导用户重新登录。
+            **qr_kwargs: ``auto_login=True`` 时透传给 :meth:`login`。
+
+        返回:
+            校验或登录后有效的 :class:`Credentials`。
+
+        异常:
+            ``RuntimeError``: ``auto_login=False`` 且当前 cookie 无效;
+            或扫码流程本身失败时抛出原始异常。
+
+        本方法只做"凭据探活 / 必要时重登"; 不会触发 dispatch 或 connect。
+        调用方在拿到结果后再决定 :meth:`dispatch` / :meth:`connect` / :meth:`run`。
+        """
+        cookie = self.account.cookie or self.authenticator.load_cookie()
+        valid, info = self.authenticator.check(cookie) if cookie else (False, {"message": "missing cookie"})
+        if not valid:
+            if not auto_login:
+                reason = info.get("message") or "cookie 无效"
+                raise RuntimeError(f"登录态无效: {reason}")
+            return self.login(**qr_kwargs)
+
+        credentials = Credentials(cookie=cookie)
+        self._apply_credentials(credentials)
+        return credentials
 
     def _store_account_sync(self, account_sync: dict | None) -> None:
         """保存 Dispatcher 初始化返回的账号态，供后续会话复用。
