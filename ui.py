@@ -13,7 +13,7 @@ from pathlib import Path
 try:
     import tkinter as tk
     from tkinter import font, ttk
-    from PIL import ImageTk
+    from PIL import Image, ImageTk
 except ModuleNotFoundError as exc:
     raise SystemExit(
         "tkinter is not installed in this Python. Install the system package first, "
@@ -169,6 +169,10 @@ class CloudGameTkApp:
         self.last_auto_click_skip_at = 0.0
         self.last_finish_result: dict | None = None
         self.root_dir = Path(__file__).resolve().parent
+        self.login_window: tk.Toplevel | None = None
+        self.login_status_var: tk.StringVar | None = None
+        self.login_qr_label: ttk.Label | None = None
+        self.login_qr_photo = None
         self.queue_type_var = tk.StringVar(value=self.settings.queue_type or QUEUE_TYPE_NORMAL)
         self.auto_click_var = tk.BooleanVar(value=bool(self.settings.auto_click))
 
@@ -222,6 +226,8 @@ class CloudGameTkApp:
         )
         self.coin_queue_radio.pack(side=tk.LEFT, padx=(2, 12))
 
+        self.login_btn = ttk.Button(toolbar, text="Login", command=self.login)
+        self.login_btn.pack(side=tk.LEFT, padx=4)
         self.full_btn = ttk.Button(toolbar, text="Dispatch + Start", command=self.dispatch_and_start)
         self.full_btn.pack(side=tk.LEFT, padx=4)
         self.dispatch_btn = ttk.Button(toolbar, text="Dispatch Only", command=self.dispatch_only)
@@ -326,6 +332,7 @@ class CloudGameTkApp:
         """切换运行状态和按钮可用性。"""
         self.running = running
         state = tk.DISABLED if running else tk.NORMAL
+        self.login_btn.configure(state=state)
         self.full_btn.configure(state=state)
         self.dispatch_btn.configure(state=state)
         self.start_btn.configure(state=state)
@@ -656,6 +663,10 @@ class CloudGameTkApp:
         """只启动连接流程。"""
         self._start_worker("connect")
 
+    def login(self) -> None:
+        """检查登录态，必要时弹出二维码登录窗口。"""
+        self._start_worker("login")
+
     def _start_worker(self, mode: str) -> None:
         """启动后台工作线程。"""
         if self.worker and self.worker.is_alive():
@@ -694,6 +705,8 @@ class CloudGameTkApp:
     def _worker_main(self, mode: str) -> None:
         """在线程中执行调度或连接任务。"""
         try:
+            if mode == "login":
+                self._run_login()
             if mode in ("full", "dispatch"):
                 self._run_dispatch()
             if mode in ("full", "connect") and not self.stop_event.is_set():
@@ -736,16 +749,50 @@ class CloudGameTkApp:
         )
         # 每次创建都通过 load_credentials 重新读 credentials.json：用户在另一终端
         # 跑 qrcode_login.py 重登后, 不重启 UI, 下一次 Dispatch 也能拿到新凭据。
-        # GUI 没法在工作线程里阻塞等终端扫码 → auto_login=False, 失效时抛
-        # RuntimeError 由 _worker_main 转写到状态栏, 提示用户去命令行登录后再试。
         core.load_credentials(self.root_dir / "credentials.json")
-        try:
-            core.ensure_login(auto_login=False)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"{exc}; 请在命令行运行 `python qrcode_login.py login` 重新登录后再试"
-            ) from exc
+        self._ensure_login(core)
         return core
+
+    def _ensure_login(self, core: CloudGame) -> None:
+        """校验登录态；缺失或失效时在 GUI 中发起扫码登录。"""
+        if core.ensure_login(auto_login=False):
+            self.events.put(("status", ("登录态有效", logging.INFO)))
+            return
+
+        self.events.put(("auth_start", None))
+        self.events.put(("status", ("登录态无效或缺失，请扫码登录", logging.WARNING)))
+
+        def on_status(message: str) -> None:
+            """把认证进度转发到 UI 主线程。"""
+            self.events.put(("auth_status", message))
+            qr_path = self._qr_path_from_status(message)
+            if qr_path is not None:
+                self.events.put(("auth_qr", qr_path))
+
+        try:
+            core.login(
+                poll_interval=3.0,
+                timeout=180,
+                terminal=False,
+                save_png=True,
+                on_status=on_status,
+            )
+        except Exception as exc:
+            self.events.put(("auth_error", str(exc)))
+            raise
+        self.events.put(("auth_done", "登录成功，credentials.json 已更新"))
+
+    @staticmethod
+    def _qr_path_from_status(message: str) -> str | None:
+        """从 Authenticator 状态行里提取二维码 PNG 路径。"""
+        marker = "二维码已保存:"
+        if marker not in message:
+            return None
+        return message.split(marker, 1)[1].strip()
+
+    def _run_login(self) -> None:
+        """单独执行一次登录态检查/扫码。"""
+        self._create_core()
 
     @staticmethod
     def _format_wallet_summary(wallet: dict) -> str:
@@ -852,6 +899,72 @@ class CloudGameTkApp:
             return "error"
         return "status"
 
+    def _show_login_window(self) -> None:
+        """创建或显示扫码登录窗口。"""
+        if self.login_window is not None and self.login_window.winfo_exists():
+            self.login_window.deiconify()
+            self.login_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("扫码登录")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="请用米游社或云·星穹铁道移动端扫码确认登录").pack(anchor=tk.W)
+        self.login_status_var = tk.StringVar(value="正在申请二维码...")
+        ttk.Label(frame, textvariable=self.login_status_var, wraplength=340).pack(fill=tk.X, pady=(8, 12))
+
+        self.login_qr_label = ttk.Label(frame, text="等待二维码...")
+        self.login_qr_label.pack(padx=8, pady=8)
+
+        ttk.Button(frame, text="隐藏", command=window.withdraw).pack(anchor=tk.E, pady=(8, 0))
+        self.login_window = window
+
+    def _update_login_status(self, message: str) -> None:
+        """刷新扫码窗口和日志中的登录状态。"""
+        self._show_login_window()
+        if self.login_status_var is not None:
+            self.login_status_var.set(message)
+        self._append_log("status", f"[login] {message}\n")
+
+    def _show_login_qr(self, path_text: str) -> None:
+        """在扫码窗口中展示二维码 PNG。"""
+        self._show_login_window()
+        path = Path(path_text)
+        try:
+            image = Image.open(path)
+            image.thumbnail((320, 320))
+            self.login_qr_photo = ImageTk.PhotoImage(image)
+        except Exception as exc:
+            self._append_log("error", f"[login] failed to load QR image: {exc}\n")
+            if self.login_status_var is not None:
+                self.login_status_var.set(f"二维码加载失败: {exc}")
+            return
+        if self.login_qr_label is not None:
+            self.login_qr_label.configure(image=self.login_qr_photo, text="")
+        if self.login_status_var is not None:
+            self.login_status_var.set("请扫码并在手机上确认登录")
+
+    def _finish_login_window(self, message: str) -> None:
+        """登录成功后关闭扫码窗口并记录状态。"""
+        if self.login_status_var is not None:
+            self.login_status_var.set(message)
+        self._append_log("status", f"[login] {message}\n")
+        if self.login_window is not None and self.login_window.winfo_exists():
+            self.login_window.after(800, self.login_window.withdraw)
+
+    def _fail_login_window(self, message: str) -> None:
+        """登录失败时保留窗口并展示错误。"""
+        self._show_login_window()
+        if self.login_status_var is not None:
+            self.login_status_var.set(f"登录失败: {message}")
+        self._append_log("error", f"[login] {message}\n")
+
     def _drain_events(self) -> None:
         """从线程事件队列刷新界面。"""
         try:
@@ -873,6 +986,16 @@ class CloudGameTkApp:
                 elif kind == "dispatch":
                     message, level = self._log_payload(payload)
                     self._append_log(self._tag_for_level(level), f"[dispatch] {message}\n")
+                elif kind == "auth_start":
+                    self._show_login_window()
+                elif kind == "auth_status":
+                    self._update_login_status(str(payload))
+                elif kind == "auth_qr":
+                    self._show_login_qr(str(payload))
+                elif kind == "auth_done":
+                    self._finish_login_window(str(payload))
+                elif kind == "auth_error":
+                    self._fail_login_window(str(payload))
                 elif kind == "error":
                     self.status_var.set(str(payload))
                     self._append_log("error", f"{payload}\n")

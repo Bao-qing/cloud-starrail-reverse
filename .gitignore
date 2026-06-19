@@ -1,7 +1,9 @@
 .venv/
 credentials.json
+credentials.json.bak*
 __pycache__/
 *.py[cod]
 .idea/
 web/
 log/
+finish_result.json
