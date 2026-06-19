@@ -130,7 +130,7 @@ class SdkGameDataHandler:
     def __init__(
             self,
             sdk_login: dict | None = None,
-            cookie: str = "",
+            cookie: str | None = None,
             combo_token: str = "",
             channel_token: str = "",
             clipboard_getter: Callable[[], str] | None = None,
@@ -139,7 +139,7 @@ class SdkGameDataHandler:
         """初始化实例并保存运行所需的状态。"""
         self.cloud_data: dict[str, str] = {}
         self.sdk_login = sdk_login
-        self.cookie = cookie
+        self.cookie = cookie or ""
         self.combo_token = combo_token
         self.channel_token = channel_token
         self.clipboard_text = ""
@@ -754,7 +754,7 @@ class SessionConfig:
     ws_log_payload: bool = True
     ws_payload_limit: int = 2048
     color: bool = False
-    cookie: str = ""
+    cookie: str | None = None
     combo_token: str = ""
     channel_token: str = ""
     clipboard_getter: Callable[[], str] | None = None

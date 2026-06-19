@@ -3,13 +3,13 @@
 """
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from pathlib import Path
 
-from core import CloudGame, QUEUE_TYPE_COIN, QUEUE_TYPE_NORMAL, configure_logging, get_logger
+from core import CloudGame, QUEUE_TYPE_NORMAL, configure_logging, get_logger
 from core.models import CloudGameConfig
-
 
 logger = get_logger("demo")
 
@@ -22,21 +22,36 @@ logger = get_logger("demo")
 #     except ValueError as exc:
 #         raise RuntimeError(f"core config must be a JSON object: {path}") from exc
 
+def load_cookie(path="credentials.json"):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with open(path) as f:
+        return json.load(f).get("cookie", "")
+
+
+
+def make_cloud_game(config: CloudGameConfig) -> CloudGame:
+    """创建 CloudGame 并通过 ``load_credentials`` 加载凭据文件。"""
+    cloud_game = CloudGame(config=config, qr_dir="log", cookie=load_cookie())
+    # cloud_game.load_credentials("credentials.json")
+    return cloud_game
+
 
 def authenticate(cloud_game: CloudGame) -> None:
     """所有 demo 在 dispatch / connect 前的统一前置: 检查或登录。
 
     ``ensure_login(auto_login=True)`` 会:
-        1. 从 ``credentials.json`` 加载 cookie;
+        1. 使用 ``cloud_game.load_credentials()`` 之前已加载的 cookie;
         2. 调 ``webVerifyForGame`` 探活;
         3. 失效或缺失时, 自动启动扫码登录 (在终端打印二维码 + 写出
-           ``log/qrcode_<时间戳>.png``), 完成后写回 ``credentials.json``。
+           ``log/qrcode_<时间戳>.png``), 完成后写回先前传入的凭据文件。
 
     若 demo 跑在没有终端交互的环境 (CI / 容器), 改成 ``auto_login=False`` 让
     它在 cookie 失效时直接抛 ``RuntimeError`` 即可, 由调用方决定如何引导。
     """
-    info = cloud_game.ensure_login(auto_login=True)
-    logger.info("登录态有效, cookie 长度=%s", len(info.cookie))
+    cookie = cloud_game.ensure_login(auto_login=True)
+    logger.info("登录态有效, cookie 长度=%s", len(cookie))
 
 
 async def snapshot_interval() -> None:
@@ -47,13 +62,11 @@ async def snapshot_interval() -> None:
         snapshot_interval=5,
         snapshot_dir=".",
     )
-    cloud_game = CloudGame(
-        config=config,
-        # callbacks=CloudGameCallbacks(
-        #     on_status=lambda message, level: logger.log(level, message),
-        #     on_dispatch_log=lambda message, level: logger.log(level, message),
-        # ),
-    )
+    cloud_game = make_cloud_game(config)
+    # callbacks=CloudGameCallbacks(
+    #     on_status=lambda message, level: logger.log(level, message),
+    #     on_dispatch_log=lambda message, level: logger.log(level, message),
+    # ),
     authenticate(cloud_game)
     await cloud_game.run(dispatch=True, connect=True)
 
@@ -65,13 +78,11 @@ async def snapshot_manual() -> None:
         # snapshot_interval=5,
         # snapshot_dir=".",
     )
-    cloud_game = CloudGame(
-        config=config,
-        # callbacks=CloudGameCallbacks(
-        #     on_status=lambda message, level: logger.log(level, message),
-        #     on_dispatch_log=lambda message, level: logger.log(level, message),
-        # ),
-    )
+    cloud_game = make_cloud_game(config)
+    # callbacks=CloudGameCallbacks(
+    #     on_status=lambda message, level: logger.log(level, message),
+    #     on_dispatch_log=lambda message, level: logger.log(level, message),
+    # ),
     authenticate(cloud_game)
     run_task = asyncio.create_task(cloud_game.run(dispatch=True, connect=True))
     try:
@@ -99,9 +110,7 @@ async def account_info() -> None:
         queue_type=queue_type,
         # core_config=load_core_config(),
     )
-    cloud_game = CloudGame(
-        config=config,
-    )
+    cloud_game = make_cloud_game(config)
     authenticate(cloud_game)
 
     wallet = await asyncio.to_thread(cloud_game.get_wallet_info)
@@ -135,9 +144,7 @@ async def input_demo() -> None:
         video_frame_interval=None,
         # core_config=load_core_config(),
     )
-    cloud_game = CloudGame(
-        config=config,
-    )
+    cloud_game = make_cloud_game(config)
     authenticate(cloud_game)
 
     async def save_screenshot(filename: str, label: str) -> None:
@@ -214,9 +221,7 @@ async def redeem_code_demo() -> None:
         video_frame_interval=None,
         # core_config=load_core_config(),
     )
-    cloud_game = CloudGame(
-        config=config,
-    )
+    cloud_game = make_cloud_game(config)
     authenticate(cloud_game)
 
     async def save_screenshot(filename: str, label: str) -> None:

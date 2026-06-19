@@ -5,18 +5,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 import logging
 import threading
-from typing import Any
 
-from .auth import Authenticator
+from pathlib import Path
+from typing import Any
+from typing import Optional
+from .auth import Authenticator, load_cookie as _load_cookie_file, save_cookie as _save_cookie_file
 from .config import normalize_core_config
 from .dispatcher import DispatchConfig, Dispatcher, QUEUE_TYPE_COIN, QUEUE_TYPE_NORMAL
 from .log import emit_log_callback
-from .models import CloudGameConfig, Credentials, InputAction
+from .models import CloudGameConfig, InputAction
 from .session import ControlActionScript, GameSession, SessionConfig
 
 __all__ = [
     "AccountState",
-    "Authenticator",
     "CloudGame",
     "CloudGameCallbacks",
     "CloudGameState",
@@ -37,7 +38,7 @@ class AccountState:
         open_id: 当前账号 ID，仅用于日志和状态观察。
     """
 
-    cookie: str = ""
+    cookie: str | None = None
     combo_token: str = ""
     channel_token: str = ""
     sdk_login: dict | None = None
@@ -88,28 +89,32 @@ class CloudGame:
     """
 
     def __init__(
-        self,
-        config: CloudGameConfig | None = None,
-        credentials: Credentials | None = None,
-        callbacks: CloudGameCallbacks | None = None,
-        authenticator: Authenticator | None = None,
+            self,
+            config: CloudGameConfig | None = None,
+            cookie: str | None = None,
+            callbacks: CloudGameCallbacks | None = None,
+            qr_dir: Path | str | None = None,
     ) -> None:
         """创建云游戏客户端门面。
 
         参数:
             config: 完整运行配置；None 表示使用 ``CloudGameConfig`` 默认值。
-            credentials: 初始账号凭据；None 表示稍后通过方法参数传入。
+            cookie: 初始单行 Cookie；None 表示调用方没有提供 cookie, 后续
+                ``ensure_login`` 会按需进入登录流程。空字符串也会被当作调用方
+                显式提供的 cookie 参与校验, 不会被当成 None。
             callbacks: 统一事件回调；方法参数中的旧回调仍会临时覆盖。
-            authenticator: 通行证认证客户端；None 时按 ``config.root_dir``
-                自动创建一个默认实例 (``credentials.json`` + ``log/`` 二维码目录)。
-                供 :meth:`login` / :meth:`ensure_login` 使用; 与 ``Dispatcher``
-                完全解耦, 调度链路不会触达本实例。
+            qr_dir: 扫码二维码 PNG 输出目录；None 时内部 ``Authenticator``
+                使用默认值 ``log/``。
+
+        本类**不主动读盘**。需要从 JSON 文件加载凭据请显式调用
+        :meth:`load_credentials`; 该方法同时记住路径, 让后续 :meth:`login`
+        在扫码登录成功后写回到同一个文件。
         """
         config = config or CloudGameConfig()
         core_config = normalize_core_config(config.core_config)
         self.config = replace(config, core_config=core_config)
         self.account = AccountState(
-            cookie="",
+            cookie=None,
             combo_token="",
             channel_token="",
             sdk_login=None,
@@ -117,12 +122,12 @@ class CloudGame:
         self.callbacks = callbacks or CloudGameCallbacks()
         self.state = CloudGameState()
         self.dispatcher = Dispatcher(self.dispatch_config)
-        self.authenticator = authenticator or Authenticator(
-            credentials_path=self.config.root_dir / "credentials.json",
-            qr_dir=self.config.root_dir / "log",
-        )
+        # 凭据文件路径仅由 load_credentials() 设置; CloudGame 不会主动读它。
+        self.credentials_path: Path | None = None
+        # Authenticator 是登录二次封装的内部细节, 不读不写文件。
+        self.authenticator = Authenticator(qr_dir=qr_dir or "log")
         self.game_session: GameSession | None = None
-        self._apply_credentials(credentials)
+        self._apply_credentials(cookie)
 
         self._video_frame_request = threading.Event()
         self._video_frame_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
@@ -139,17 +144,21 @@ class CloudGame:
         """
         return ControlActionScript.load(path, click)
 
-    def _apply_credentials(self, credentials: Credentials | None) -> None:
-        """把调用方传入的凭据合并到运行配置。
+    def _apply_credentials(self, cookie: str | None) -> None:
+        """把调用方传入的持久 cookie 应用到运行配置。
 
-        参数:
-            credentials: Cookie、combo token 和 channel token；None 表示不更新。
+        combo/channel token 与 ``sdk_login`` 都是运行时派生态, 绑定到当前
+        cookie; cookie 更新时必须清空这些派生值, 避免复用旧账号态。
         """
-        if credentials is None:
+        if cookie is None:
             return
-        self.account.cookie = credentials.cookie
-        self.account.combo_token = credentials.combo_token
-        self.account.channel_token = credentials.channel_token
+        cookie_changed = cookie != self.account.cookie
+        self.account.cookie = cookie
+        if cookie_changed:
+            self.account.combo_token = ""
+            self.account.channel_token = ""
+            self.account.sdk_login = None
+            self.account.open_id = ""
         self._reset_dispatcher()
 
     def _reset_dispatcher(self) -> None:
@@ -159,64 +168,103 @@ class CloudGame:
             old_dispatcher.close()
         self.dispatcher = Dispatcher(self.dispatch_config)
 
+    def _authenticator(self) -> Authenticator:
+        """返回内部认证器。"""
+        return self.authenticator
+
     # ------------------------------------------------------------------
-    # 登录态管理 —— Authenticator 二次封装
+    # 登录态管理 —— Authenticator
     # ------------------------------------------------------------------
-    def login(self, **qr_kwargs) -> Credentials:
-        """触发扫码登录, 写回 ``credentials.json`` 并应用到当前 CloudGame。
+    def load_credentials(self, path: Path | str) -> str | None:
+        """从指定 JSON 文件读取 cookie 并应用到 CloudGame。
+
+        同时记住该路径, 作为后续 :meth:`login` / :meth:`ensure_login` 自动
+        扫码登录后回写 cookie 的位置。``CloudGame`` 只在这个方法里读盘,
+        其他时候不会主动碰文件系统。
+
+        参数:
+            path: 凭据 JSON 文件路径, 文件结构形如 ``{"cookie": "..."}``。
+
+        返回:
+            读到的单行 Cookie header; 文件缺失或字段缺失返回 ``None``。
+            ``None`` 不会清除已有 ``self.account.cookie``。
+        """
+        cookie_path = Path(path)
+        self.credentials_path = cookie_path
+        cookie = _load_cookie_file(cookie_path, logger=self.authenticator.logger)
+        if cookie is not None:
+            self._apply_credentials(cookie)
+        return cookie
+
+    def login(self, **qr_kwargs) -> str:
+        """触发扫码登录, 应用到 CloudGame, 必要时写回凭据文件。
 
         参数:
             **qr_kwargs: 透传给 :meth:`Authenticator.login_qrcode`, 例如
                 ``poll_interval``、``timeout``、``terminal``、``on_status`` 等。
+                ``existing_cookie`` 默认填入当前 ``self.account.cookie``,
+                用于复用 ``_MHYUUID`` / ``DEVICEFP`` 等设备指纹字段。
 
         返回:
-            新的 :class:`Credentials`。combo_token / channel_token 字段为空,
-            后续 ``dispatch()`` 时由 ``Dispatcher.init()`` 填回。
+            新的单行 Cookie header。combo/channel token 会在后续 ``dispatch()``
+            里的 ``Dispatcher.init()`` 阶段派生并写入 ``self.account``。
 
         副作用:
-            - 默认会写出 ``credentials.json`` (除非 ``write_credentials=False``)。
+            - 当 :attr:`credentials_path` 不为空时, 把新 cookie 写回该文件;
+              已存在则按时间戳生成 ``.bak``。
             - 重建内部 ``Dispatcher`` 以使用新 cookie。
         """
-        cookie = self.authenticator.login_qrcode(**qr_kwargs)
-        credentials = Credentials(cookie=cookie)
-        self._apply_credentials(credentials)
-        return credentials
+        auth = self._authenticator()
+        qr_kwargs.setdefault("existing_cookie", self.account.cookie)
+        cookie = auth.login_qrcode(**qr_kwargs)
+        if self.credentials_path is not None:
+            saved = _save_cookie_file(self.credentials_path, cookie, logger=auth.logger)
+            auth.logger.info("已写入 credentials.json: %s", saved)
+        self._apply_credentials(cookie)
+        return cookie
 
     def ensure_login(
-        self,
-        *,
-        auto_login: bool = True,
-        **qr_kwargs,
-    ) -> Credentials:
+            self,
+            *,
+            auto_login: bool = True,
+            **qr_kwargs,
+    ) -> Optional[str]:
         """初始化登录态, 必要时重新进入扫码登录。
 
         参数:
             auto_login: cookie 失效或缺失时是否自动触发扫码登录。
-                ``False`` 时直接抛出 ``RuntimeError``, 由调用方 (例如 GUI)
+                ``False`` 时直接返回 ``None``, 由调用方 (例如 GUI)
                 自行决定如何引导用户重新登录。
             **qr_kwargs: ``auto_login=True`` 时透传给 :meth:`login`。
 
         返回:
-            校验或登录后有效的 :class:`Credentials`。
-
-        异常:
-            ``RuntimeError``: ``auto_login=False`` 且当前 cookie 无效;
-            或扫码流程本身失败时抛出原始异常。
+            校验或登录后有效的单行 Cookie header；
+            若当前无效且 ``auto_login=False``，或扫码登录流程失败，则返回 ``None``。
 
         本方法只做"凭据探活 / 必要时重登"; 不会触发 dispatch 或 connect。
         调用方在拿到结果后再决定 :meth:`dispatch` / :meth:`connect` / :meth:`run`。
         """
-        cookie = self.account.cookie or self.authenticator.load_cookie()
-        valid, info = self.authenticator.check(cookie) if cookie else (False, {"message": "missing cookie"})
+        cookie = self.account.cookie
+        if cookie is None:
+            if not auto_login:
+                return None
+            try:
+                return self.login(**qr_kwargs)
+            except Exception:
+                return None
+
+        auth = self._authenticator()
+        valid, info = auth.check(cookie)
         if not valid:
             if not auto_login:
-                reason = info.get("message") or "cookie 无效"
-                raise RuntimeError(f"登录态无效: {reason}")
-            return self.login(**qr_kwargs)
+                return None
+            try:
+                return self.login(**qr_kwargs)
+            except Exception:
+                return None
 
-        credentials = Credentials(cookie=cookie)
-        self._apply_credentials(credentials)
-        return credentials
+        self._apply_credentials(cookie)
+        return cookie
 
     def _store_account_sync(self, account_sync: dict | None) -> None:
         """保存 Dispatcher 初始化返回的账号态，供后续会话复用。
@@ -366,7 +414,6 @@ class CloudGame:
                 ]
             raise
 
-
     def send_input(self, action: dict | InputAction) -> bool:
         """向当前活动会话排入一个输入动作。
 
@@ -432,10 +479,10 @@ class CloudGame:
         )
 
     async def connect(
-        self,
-        *,
-        finish_result: dict | None = None,
-        stop_event=None,
+            self,
+            *,
+            finish_result: dict | None = None,
+            stop_event=None,
     ) -> None:
         """连接一个已经完成调度的云游戏实例。
 
@@ -477,11 +524,11 @@ class CloudGame:
             self._video_frame_request.clear()
 
     async def run(
-        self,
-        *,
-        dispatch: bool = True,
-        connect: bool = True,
-        stop_event=None,
+            self,
+            *,
+            dispatch: bool = True,
+            connect: bool = True,
+            stop_event=None,
     ) -> dict | None:
         """按开关执行 dispatch 和/或 connect 的高层工作流。
 

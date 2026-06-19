@@ -18,7 +18,7 @@ This is a Python client for dispatching and connecting to a cloud game session.
 - `dispatcher.py` handles HTTP account sync, wallet/queue queries, polling, and final instance dispatch. `DispatchConfig` carries dispatch-only settings, cookies, queue type, node, and client profile data.
 - `session.py` owns the live connection lifecycle. It creates WebSocket connections, negotiates WebRTC, handles SDK game-data callbacks, consumes video tracks, sends control actions, formats WebSocket payloads, and runs `GameSession`.
 - `protocol.py` contains constants and binary protocol helpers: frame types, command IDs, protobuf-like encoding, packet/frame builders/parsers, SDK start parameter parsing, input packet encoding, and AES helpers.
-- `models.py` contains shared dataclasses: `Credentials`, `CloudGameConfig`, `GameTicket`, and `InputAction`. Prefer adding cross-layer configuration or value objects here instead of duplicating dict shapes.
+- `models.py` contains shared dataclasses: `CloudGameConfig`, `GameTicket`, and `InputAction`. Prefer adding cross-layer configuration or value objects here instead of duplicating dict shapes.
 - `config.py` defines default runtime profiles and comment-tolerant JSON loading. `CoreConfig` merges `client_profile.json`-style overrides and exposes them by attribute.
 - `log.py` centralizes logger naming, console logging setup, noisy dependency suppression, and backward-compatible log callbacks.
 

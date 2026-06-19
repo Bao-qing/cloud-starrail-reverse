@@ -1,7 +1,7 @@
 """米哈游通行证扫码登录 / cookie 校验的命令行入口。
 
 业务逻辑全部位于 :mod:`core.auth.Authenticator`; 本脚本只负责命令行参数
-解析与人类可读输出。
+解析、文件 IO 和人类可读输出。
 
 抓包参考: ``log/qrcode_login.har``。完整流程与端点在 :mod:`core.auth`
 模块文档中说明。
@@ -19,7 +19,14 @@ import json
 import sys
 from pathlib import Path
 
-from core.auth import REQUIRED_COOKIES, Authenticator, is_placeholder, parse_cookie_header
+from core.auth import (
+    REQUIRED_COOKIES,
+    Authenticator,
+    is_placeholder,
+    load_cookie,
+    parse_cookie_header,
+    save_cookie,
+)
 
 
 def report_cookies(cookies: dict[str, str]) -> int:
@@ -96,8 +103,10 @@ def parse_args() -> argparse.Namespace:
 
 def cmd_check(args: argparse.Namespace) -> int:
     """``check`` 子命令: 调 ``Authenticator.check`` 并友好打印结果。"""
-    auth = Authenticator(credentials_path=args.credentials)
-    cookie = args.cookie  # None 时让 Authenticator 自己 load
+    auth = Authenticator()
+    cookie = args.cookie
+    if cookie is None:
+        cookie = load_cookie(args.credentials)
     valid, info = auth.check(cookie)
 
     if args.json:
@@ -132,21 +141,19 @@ def cmd_login(args: argparse.Namespace) -> int:
     bootstrap_path = Path(args.credentials) if args.credentials else Path(args.output)
     output_path = Path(args.output)
 
-    auth = Authenticator(credentials_path=bootstrap_path, qr_dir=args.qr_dir)
+    auth = Authenticator(qr_dir=args.qr_dir)
     cookie = auth.login_qrcode(
+        existing_cookie=load_cookie(bootstrap_path),
         poll_interval=args.poll_interval,
         timeout=args.timeout,
         verify=not args.no_verify,
-        write_credentials=False,  # 由本函数控制写出路径
         save_png=not args.no_png,
         terminal=not args.no_terminal,
         light_terminal=args.light_terminal,
         on_status=print,
     )
 
-    # 把结果写到 --output 指定的位置 (可能与 bootstrap 来源不同)
-    out_auth = auth if output_path == bootstrap_path else Authenticator(credentials_path=output_path)
-    saved = out_auth.save_cookie(cookie, backup=not args.no_backup)
+    saved = save_cookie(output_path, cookie, backup=not args.no_backup)
     cookies = parse_cookie_header(cookie)
     print(f"      已写入: {saved}  (共 {len(cookies)} 个 cookie 字段)")
 

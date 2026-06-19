@@ -8,13 +8,6 @@ from typing import Any
 from .config import CoreConfig
 
 
-@dataclass(frozen=True)
-class Credentials:
-    cookie: str
-    combo_token: str = ""
-    channel_token: str = ""
-
-
 @dataclass
 class CloudGameConfig:
     max_seconds: int = 0

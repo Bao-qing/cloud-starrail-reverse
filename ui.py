@@ -725,6 +725,7 @@ class CloudGameTkApp:
         )
         core = CloudGame(
             config=config,
+            qr_dir=self.root_dir / "log",
             callbacks=CloudGameCallbacks(
                 on_status=lambda message, level: self.events.put(("status", (message, level))),
                 on_dispatch_log=lambda line, level: self.events.put(("dispatch", (line, level))),
@@ -733,11 +734,11 @@ class CloudGameTkApp:
                 on_input_ready=self._set_input_ready,
             ),
         )
-        # 不在这里传 credentials —— 让 Authenticator 每次都从 credentials.json
-        # 读最新 cookie, 这样用户在另一终端跑 qrcode_login.py 重登后, 不重启 UI
-        # 下一次 Dispatch 也能直接拿到新凭据。
+        # 每次创建都通过 load_credentials 重新读 credentials.json：用户在另一终端
+        # 跑 qrcode_login.py 重登后, 不重启 UI, 下一次 Dispatch 也能拿到新凭据。
         # GUI 没法在工作线程里阻塞等终端扫码 → auto_login=False, 失效时抛
         # RuntimeError 由 _worker_main 转写到状态栏, 提示用户去命令行登录后再试。
+        core.load_credentials(self.root_dir / "credentials.json")
         try:
             core.ensure_login(auto_login=False)
         except RuntimeError as exc:

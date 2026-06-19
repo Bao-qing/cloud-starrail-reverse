@@ -72,6 +72,41 @@ TERMINAL_FAIL_STATUSES: frozenset[str] = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# 凭据文件 IO
+# ---------------------------------------------------------------------------
+def load_cookie(path: Path | str, *, logger: logging.Logger | None = None) -> str | None:
+    """从指定 JSON 文件读取 ``cookie`` 字段。
+
+    调用方必须显式传入路径。文件缺失、读取失败或字段缺失时返回 ``None``；
+    如果文件中显式写了 ``"cookie": ""``，则返回空字符串。
+    """
+    cookie_path = Path(path)
+    if not cookie_path.exists():
+        return None
+    try:
+        data = json.loads(cookie_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        (logger or get_logger("auth")).warning("读取 %s 失败: %s", cookie_path, exc)
+        return None
+    if "cookie" not in data:
+        return None
+    return str(data.get("cookie") or "")
+
+
+def save_cookie(path: Path | str, cookie: str, *, backup: bool = True, logger: logging.Logger | None = None) -> Path:
+    """把 cookie 写入指定 JSON 文件；已存在时可按时间戳生成 ``.bak``。"""
+    cookie_path = Path(path)
+    if cookie_path.exists() and backup:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_path = cookie_path.with_suffix(cookie_path.suffix + f".bak.{timestamp}")
+        backup_path.write_bytes(cookie_path.read_bytes())
+        (logger or get_logger("auth")).info("原文件已备份: %s", backup_path)
+    payload = {"cookie": cookie}
+    cookie_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return cookie_path
+
+
+# ---------------------------------------------------------------------------
 # 纯工具函数 —— Dispatcher 等模块可直接 import 复用
 # ---------------------------------------------------------------------------
 def parse_cookie_header(text: str) -> dict[str, str]:
@@ -150,15 +185,21 @@ def make_verify_headers(base: dict[str, str]) -> dict[str, str]:
 class Authenticator:
     """米哈游通行证认证客户端: 扫码登录 + cookie 有效性校验。
 
+    本类只承担**纯认证逻辑**: 不读、不写凭据文件 —— 文件 IO 由调用方
+    (``core.cloud_game.CloudGame`` 或 ``qrcode_login.py`` 这样的 CLI) 通过
+    模块级 :func:`load_cookie` / :func:`save_cookie` 自行完成。
+
     与 :class:`core.dispatcher.Dispatcher` 解耦 —— Dispatcher 永远不会 import
     本类, 只共享本模块顶部的常量与纯工具函数。
 
     典型用法::
 
-        auth = Authenticator()                  # 默认读 ./credentials.json
-        valid, info = auth.check()              # 探活
+        auth = Authenticator()
+        valid, info = auth.check(cookie)               # 探活
         if not valid:
-            auth.login_qrcode()                 # 扫码并写回 credentials.json
+            new_cookie = auth.login_qrcode(            # 扫码并返回 cookie
+                existing_cookie=cookie,                # 复用设备指纹
+            )
 
     GUI / CLI 集成时通过 ``on_status`` 回调接管文字进度提示,
     通过 ``terminal=False`` / ``save_png=False`` 控制二维码渲染目的地。
@@ -166,7 +207,6 @@ class Authenticator:
 
     def __init__(
         self,
-        credentials_path: Path | str = "credentials.json",
         *,
         qr_dir: Path | str = "log",
         logger: logging.Logger | None = None,
@@ -174,50 +214,20 @@ class Authenticator:
         """初始化认证客户端。
 
         参数:
-            credentials_path: ``credentials.json`` 路径, 同时也是设备指纹的
-                来源 —— 若文件存在, ``_MHYUUID`` / ``DEVICEFP`` 等会被复用。
             qr_dir: 扫码时二维码 PNG 的输出目录, 不存在会自动创建。
             logger: 自定义日志器; 默认使用 ``core.log.get_logger("auth")``。
         """
-        self.credentials_path = Path(credentials_path)
         self.qr_dir = Path(qr_dir)
         self.logger = logger or get_logger("auth")
 
     # ------------------------------------------------------------------
-    # 凭据 IO
-    # ------------------------------------------------------------------
-    def load_cookie(self) -> str:
-        """从 ``credentials.json`` 读取 ``cookie`` 字段; 文件缺失/字段缺失返回空串。"""
-        path = self.credentials_path
-        if not path.exists():
-            return ""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            self.logger.warning("读取 %s 失败: %s", path, exc)
-            return ""
-        return str(data.get("cookie") or "")
-
-    def save_cookie(self, cookie: str, *, backup: bool = True) -> Path:
-        """把 cookie 写回 ``credentials.json``; 已存在时按时间戳生成 ``.bak``。"""
-        path = self.credentials_path
-        if path.exists() and backup:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            backup_path = path.with_suffix(path.suffix + f".bak.{timestamp}")
-            backup_path.write_bytes(path.read_bytes())
-            self.logger.info("原文件已备份: %s", backup_path)
-        payload = {"cookie": cookie}
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return path
-
-    # ------------------------------------------------------------------
     # 校验
     # ------------------------------------------------------------------
-    def check(self, cookie: str | None = None, *, timeout: float = 15.0) -> tuple[bool, dict[str, Any]]:
+    def check(self, cookie: str | None, *, timeout: float = 15.0) -> tuple[bool, dict[str, Any]]:
         """通过 ``webVerifyForGame`` 拉取个人信息, 判断 cookie 是否仍然有效。
 
         参数:
-            cookie: 单行 Cookie header; ``None`` 时自动调用 :meth:`load_cookie`。
+            cookie: 单行 Cookie header; ``None`` 视为缺失, 直接返回失败。
             timeout: 单次请求超时秒数。
 
         返回:
@@ -228,13 +238,20 @@ class Authenticator:
             带 ``error``。
 
         失败路径:
-            * 必需字段缺失/占位 —— 不发请求直接返回, ``retcode=-1``。
+            * cookie=None —— 不发请求, ``retcode=-1``, ``message="missing cookie"``。
+            * 必需字段缺失/占位 —— 不发请求, ``retcode=-1``。
             * 网络异常 —— ``retcode=-2``, ``error`` 为异常消息。
             * 服务端拒绝 —— ``retcode`` 为服务端 retcode (例如 ``-100`` 表示
               token 失效)。
         """
         if cookie is None:
-            cookie = self.load_cookie()
+            return False, {
+                "retcode": -1,
+                "message": "missing cookie",
+                "error": "missing cookie",
+                "cookies": {},
+                "missing": list(REQUIRED_COOKIES),
+            }
         cookies = parse_cookie_header(cookie)
         info: dict[str, Any] = {"cookies": cookies}
 
@@ -285,30 +302,29 @@ class Authenticator:
     def login_qrcode(
         self,
         *,
+        existing_cookie: str | None = None,
         poll_interval: float = 3.0,
         timeout: int = 180,
         verify: bool = True,
-        write_credentials: bool = True,
-        backup: bool = True,
         save_png: bool = True,
         terminal: bool = True,
         light_terminal: bool = False,
         on_status: Callable[[str], None] | None = None,
     ) -> str:
-        """完整扫码登录流程, 返回单行 cookie header。
+        """完整扫码登录流程, 返回单行 cookie header (不写盘)。
 
         步骤::
 
-            createQRLogin → 渲染二维码 → 轮询 queryQRLoginStatus
-                → (可选) webVerifyForGame → (可选) 写出 credentials.json
+            createQRLogin → 渲染二维码 → 轮询 queryQRLoginStatus → (可选) webVerifyForGame
 
         参数:
+            existing_cookie: 已有 cookie (单行 header); 用于复用 ``_MHYUUID`` /
+                ``DEVICEFP`` 等设备指纹字段, ``None`` 时全部新生成。文件读取由
+                调用方完成, 本方法不碰文件系统。
             poll_interval: 轮询间隔秒, 过短会被服务端判为失效。
             timeout: 等待扫码总超时秒。
             verify: 是否在 ``Confirmed`` 后追加一次 ``webVerifyForGame``,
                 与浏览器实际行为一致并刷新 cookie。
-            write_credentials: 是否把结果写回 :attr:`credentials_path`。
-            backup: 写入前是否生成 ``.bak.<timestamp>`` 备份。
             save_png: 是否在 :attr:`qr_dir` 下保存 PNG 二维码。
             terminal: 是否把二维码渲染到终端 (适合 SSH 场景)。
             light_terminal: 浅色终端时取消反色, 默认按深色终端反色显示。
@@ -316,8 +332,8 @@ class Authenticator:
                 通过 :attr:`logger` 以 INFO 级别输出。
 
         返回:
-            服务端确认后的单行 ``Cookie`` header (含必需字段); 即使
-            ``write_credentials=False`` 也会返回, 由调用方自行处理。
+            服务端确认后的单行 ``Cookie`` header (含必需字段)。调用方负责
+            后续持久化 (例如通过模块级 :func:`save_cookie`)。
 
         异常:
             ``RuntimeError``: 二维码失效、轮询超时、服务端非零 retcode 等。
@@ -331,7 +347,7 @@ class Authenticator:
             else:
                 self.logger.info(message)
 
-        bootstrap = self._load_bootstrap()
+        bootstrap = self._build_bootstrap(existing_cookie)
         device_id = bootstrap["_MHYUUID"]
         device_fp = bootstrap["DEVICEFP"]
         lifecycle_id = bootstrap["MIHOYO_LOGIN_PLATFORM_LIFECYCLE_ID"]
@@ -407,20 +423,15 @@ class Authenticator:
         for name, value in bootstrap.items():
             cookies.setdefault(name, value)
         cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items())
-
-        if write_credentials:
-            saved = self.save_cookie(cookie_header, backup=backup)
-            report(f"       已写入: {saved}  (共 {len(cookies)} 个 cookie 字段)")
-
         return cookie_header
 
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
-    def _load_bootstrap(self) -> dict[str, str]:
-        """从已有 credentials.json 复用设备指纹相关字段, 缺失/失效时新生成。"""
+    def _build_bootstrap(self, existing_cookie: str | None) -> dict[str, str]:
+        """从 ``existing_cookie`` 复用设备指纹相关字段, 缺失/失效时新生成。"""
         bootstrap: dict[str, str] = {}
-        existing = parse_cookie_header(self.load_cookie())
+        existing = parse_cookie_header(existing_cookie or "")
         for key in ("_MHYUUID", "DEVICEFP_SEED_ID", "DEVICEFP_SEED_TIME", "DEVICEFP"):
             value = existing.get(key)
             if value and not is_placeholder(value):
@@ -504,7 +515,9 @@ __all__ = [
     "gen_device_fp",
     "gen_lifecycle_id",
     "is_placeholder",
+    "load_cookie",
     "make_passport_headers",
     "make_verify_headers",
     "parse_cookie_header",
+    "save_cookie",
 ]

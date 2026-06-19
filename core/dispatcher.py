@@ -5,7 +5,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,7 +109,7 @@ class DispatchConfig:
     queue_type: str = ""
     node: str = ""
     speed_client_type: int = 7
-    cookie: str = ""
+    cookie: str | None = None
     combo_token: str = ""
     core_config: CoreConfig = field(default_factory=CoreConfig)
     root_dir: Path = Path(__file__).resolve().parent.parent
@@ -129,9 +128,9 @@ class Dispatcher:
         self._cookie_cache: dict[str, str] = {}
 
     @property
-    def cookie(self) -> str:
-        """返回显式配置或环境变量中的 Cookie。"""
-        return self.config.cookie or os.environ.get("CLOUD_GAME_COOKIE", "")
+    def cookie(self) -> str | None:
+        """返回显式配置中的 Cookie；None 表示调用方没有提供。"""
+        return self.config.cookie
 
     @property
     def combo_token(self) -> str:
@@ -140,7 +139,7 @@ class Dispatcher:
 
     def _cookie_value(self, name: str, default: str = "") -> str:
         """从 Cookie 字符串中读取指定键值, 内部缓存解析结果。"""
-        cookie = self.cookie
+        cookie = self.cookie or ""
         if cookie != self._cookie_cache_source:
             self._cookie_cache_source = cookie
             self._cookie_cache = parse_cookie_header(cookie)
@@ -186,8 +185,8 @@ class Dispatcher:
 
     def _require_credentials(self) -> None:
         """确保调度所需凭据已配置。"""
-        if not self.cookie:
-            raise RuntimeError("missing Cookie in UI test credentials")
+        if self.cookie is None:
+            raise RuntimeError("missing Cookie: caller did not provide cookie")
 
     def _post(self, url: str, body: dict, headers: dict, retries: int = 0) -> dict:
         """发送 JSON POST 请求并处理重试。"""
@@ -271,7 +270,7 @@ class Dispatcher:
             "content-type": "application/json",
             "accept": "application/json, text/plain, */*",
         }
-        if self.cookie:
+        if self.cookie is not None:
             headers["cookie"] = self.cookie
         if self.combo_token:
             headers["x-rpc-combo_token"] = self.combo_token
@@ -298,7 +297,7 @@ class Dispatcher:
             "x-rpc-game_biz": BIZ_KEY,
             "x-rpc-language": WEB_LANGUAGE,
         }
-        if self.cookie:
+        if self.cookie is not None:
             headers["cookie"] = self.cookie
         return headers
 
@@ -648,7 +647,7 @@ class Dispatcher:
         """统一记录调度完成结果并返回原始 finish_result。"""
         self._line(
             line_callback,
-            f"排队完成，队列类型={result.get('queue_type')!r} cost_method={result.get('cost_method')!r}",
+            f"排队完成，队列类型：'{'星云币优先队列' if result.get('queue_type') == QUEUE_TYPE_COIN else '普通队列'}' 消耗：'{'普通时长' if str(result.get('cost_method')) == '0' else '星云币时长'}'",
             level=logging.INFO,
         )
         self._emit_finish_result(result, line_callback)
@@ -664,11 +663,11 @@ class Dispatcher:
         branch_queue_len = queue_info.get("branch_queue_len") or "?"
         waiting_time_min = queue_info.get("waiting_time_min") or "?"
         query_interval = queue_info.get("query_interval") or "?"
-        queue_type = queue_info.get("queue_type") or "normal"
+        queue_type = "星云币优先队列" if queue_info.get("queue_type") == QUEUE_TYPE_COIN else "普通队列"
         self._line(
             line_callback,
             (
-                f"开始排队：节点={node_name}({node_id})，队列类型={queue_type}，"
+                f"开始排队：节点={node_name}({node_id})，队列类型='{queue_type}'，"
                 f"当前排名={queue_rank}/{queue_length}，总队列数={branch_queue_len}，"
                 f"预计等待={waiting_time_min}分钟，查询间隔={query_interval}秒，ticket={self._masked(ticket)}"
             ),
